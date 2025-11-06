@@ -21,8 +21,8 @@ use clarity::types::StacksEpochId;
 use clarity::types::chainstate::StacksPrivateKey;
 use clarity_cli::DEFAULT_CLI_EPOCH;
 use stacks_inspect::{
-    command_contract_hash, command_replay_mock_mining, command_try_mine, command_validate_block,
-    command_validate_block_nakamoto, drain_common_opts,
+    command_check_clarity_version, command_contract_hash, command_replay_mock_mining,
+    command_try_mine, command_validate_block, command_validate_block_nakamoto, drain_common_opts,
 };
 use stackslib::chainstate::stacks::miner::BlockBuilderSettings;
 use stackslib::chainstate::stacks::{
@@ -1588,6 +1588,11 @@ check if the associated microblocks can be downloaded
 
     if argv[1] == "validate-block" {
         command_validate_block(&argv[1..], common_opts.config.as_ref());
+        process::exit(0);
+    }
+
+    if argv[1] == "check-clarity-version" {
+        command_check_clarity_version(&argv[1..], common_opts.config.as_ref());
         process::exit(0);
     }
 

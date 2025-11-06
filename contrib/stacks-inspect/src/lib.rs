@@ -13,14 +13,17 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
 use std::{fs, process};
 
 use clarity::types::chainstate::SortitionId;
 use clarity::util::hash::{Sha512Trunc256Sum, to_hex};
+use clarity::vm::ClarityVersion;
 use regex::Regex;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, params};
+use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId};
 use stacks_common::types::sqlite::NO_PARAMS;
 use stacks_common::util::hash::Hash160;
@@ -195,6 +198,326 @@ pub fn command_validate_block(argv: &[String], conf: Option<&Config>) {
         replay_staging_block(db_path, index_block_hash, conf);
     }
     println!("Finished. run_time_seconds = {}", start.elapsed().as_secs());
+}
+
+/// Scan a range of Stacks blocks for contract deployments using a specific Clarity version
+///
+/// Arguments:
+///  - `argv`: Args in CLI format: `<command-name> [args...]`
+pub fn command_check_clarity_version(argv: &[String], conf: Option<&Config>) {
+    let print_help_and_exit = || -> ! {
+        let n = &argv[0];
+        eprintln!("Usage:");
+        eprintln!("  {n} <database-path> range <start-block> <end-block> <clarity-version>");
+        process::exit(1);
+    };
+
+    let db_path = argv.get(1).unwrap_or_else(|| print_help_and_exit());
+    let mode = argv.get(2).unwrap_or_else(|| print_help_and_exit());
+    if mode != "range" {
+        print_help_and_exit();
+    }
+
+    let start_height = argv
+        .get(3)
+        .unwrap_or_else(|| print_help_and_exit())
+        .parse::<u64>()
+        .unwrap_or_else(|_| {
+            eprintln!("<start-block> not a valid u64");
+            process::exit(1);
+        });
+    let end_height = argv
+        .get(4)
+        .unwrap_or_else(|| print_help_and_exit())
+        .parse::<u64>()
+        .unwrap_or_else(|_| {
+            eprintln!("<end-block> not a valid u64");
+            process::exit(1);
+        });
+    if start_height > end_height {
+        eprintln!("<start-block> must be <= <end-block>");
+        process::exit(1);
+    }
+
+    let version_arg = argv.get(5).unwrap_or_else(|| print_help_and_exit());
+    let version_number = version_arg.parse::<u8>().unwrap_or_else(|_| {
+        eprintln!("<clarity-version> must be a number between 1 and 4");
+        process::exit(1);
+    });
+    let clarity_version = match version_number {
+        1 => ClarityVersion::Clarity1,
+        2 => ClarityVersion::Clarity2,
+        3 => ClarityVersion::Clarity3,
+        4 => ClarityVersion::Clarity4,
+        other => {
+            eprintln!("Unsupported Clarity version number: {other}");
+            process::exit(1);
+        }
+    };
+
+    let conf = conf.unwrap_or(&DEFAULT_MAINNET_CONFIG);
+    let chain_state_path = format!("{db_path}/chainstate/");
+    let (chainstate, _) = StacksChainState::open(
+        conf.is_mainnet(),
+        conf.burnchain.chain_id,
+        &chain_state_path,
+        None,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Failed to open chainstate at {chain_state_path}: {e}");
+        process::exit(1);
+    });
+    #[derive(Clone)]
+    enum BlockSource {
+        Nakamoto,
+        Epoch2 {
+            consensus_hash: ConsensusHash,
+            anchored_block_hash: BlockHeaderHash,
+        },
+    }
+
+    #[derive(Clone)]
+    struct BlockScanEntry {
+        height: u64,
+        index_block_hash: String,
+        source: BlockSource,
+    }
+
+    let blocks_path = chainstate.blocks_path.clone();
+    let mut work_items: Vec<BlockScanEntry> = Vec::new();
+    let mut seen_index_hashes: HashSet<String> = HashSet::new();
+
+    {
+        let staging_conn = chainstate.nakamoto_blocks_db();
+        let mut stmt = staging_conn
+            .prepare(
+                "SELECT index_block_hash, height FROM nakamoto_staging_blocks \
+                 WHERE orphaned = 0 AND height BETWEEN ?1 AND ?2 ORDER BY height ASC",
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to prepare query over nakamoto_staging_blocks: {e}");
+                process::exit(1);
+            });
+        let mut rows = stmt
+            .query(params![start_height, end_height])
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to query nakamoto_staging_blocks: {e}");
+                process::exit(1);
+            });
+
+        while let Some(row) = rows.next().unwrap_or_else(|e| {
+            eprintln!("Failed to read staging block row: {e}");
+            process::exit(1);
+        }) {
+            let index_block_hash: String = row.get(0).unwrap();
+            let height: u64 = row.get(1).unwrap();
+            if seen_index_hashes.insert(index_block_hash.clone()) {
+                work_items.push(BlockScanEntry {
+                    height,
+                    index_block_hash,
+                    source: BlockSource::Nakamoto,
+                });
+            }
+        }
+    }
+
+    {
+        let staging_db_path = format!("{db_path}/chainstate/vm/index.sqlite");
+        let conn = Connection::open_with_flags(&staging_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to open staging blocks DB at {staging_db_path}: {e}");
+                process::exit(1);
+            });
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT index_block_hash, consensus_hash, anchored_block_hash, height FROM staging_blocks \
+                 WHERE orphaned = 0 AND height BETWEEN ?1 AND ?2 ORDER BY height ASC",
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to prepare query over staging_blocks: {e}");
+                process::exit(1);
+            });
+        let mut rows = stmt
+            .query(params![start_height, end_height])
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to query staging_blocks: {e}");
+                process::exit(1);
+            });
+
+        while let Some(row) = rows.next().unwrap_or_else(|e| {
+            eprintln!("Failed to read epoch2 staging block row: {e}");
+            process::exit(1);
+        }) {
+            let index_block_hash: String = row.get(0).unwrap();
+            if !seen_index_hashes.insert(index_block_hash.clone()) {
+                continue;
+            }
+            let consensus_hex: String = row.get(1).unwrap();
+            let anchored_hex: String = row.get(2).unwrap();
+            let height: u64 = row.get(3).unwrap();
+            let consensus_hash = ConsensusHash::from_hex(&consensus_hex).unwrap_or_else(|_| {
+                eprintln!(
+                    "Failed to parse consensus hash {consensus_hex} for block {index_block_hash}"
+                );
+                process::exit(1);
+            });
+            let anchored_block_hash = BlockHeaderHash::from_hex(&anchored_hex).unwrap_or_else(|_| {
+                eprintln!(
+                    "Failed to parse anchored block hash {anchored_hex} for block {index_block_hash}"
+                );
+                process::exit(1);
+            });
+            work_items.push(BlockScanEntry {
+                height,
+                index_block_hash,
+                source: BlockSource::Epoch2 {
+                    consensus_hash,
+                    anchored_block_hash,
+                },
+            });
+        }
+    }
+
+    if work_items.is_empty() {
+        println!("No blocks found between heights {start_height} and {end_height}.");
+        return;
+    }
+
+    work_items.sort_by_key(|entry| entry.height);
+
+    let total_blocks = work_items.len() as u64;
+    let actual_start = work_items.first().map(|b| b.height).unwrap_or(start_height);
+    let actual_end = work_items.last().map(|b| b.height).unwrap_or(end_height);
+
+    println!("Scanning {total_blocks} blocks between heights {actual_start} and {actual_end}...");
+    let total_blocks_f32 = total_blocks as f32;
+    let mut last_rendered = usize::MAX;
+
+    let nakamoto_conn = chainstate.nakamoto_blocks_db();
+    let mut offending: Vec<(u64, String, String)> = Vec::new();
+    for (idx, entry) in work_items.iter().enumerate() {
+        let progress = ((idx as f32 / total_blocks_f32) * 100.0).floor() as usize;
+        if progress != last_rendered {
+            print!("\rProgress: {:>3}% ({}/{})", progress, idx, total_blocks);
+            use std::io::{Write, stdout};
+            stdout().flush().ok();
+            last_rendered = progress;
+        }
+
+        let block_id = StacksBlockId::from_hex(&entry.index_block_hash).unwrap_or_else(|e| {
+            eprintln!(
+                "Failed to parse index block hash {}: {e}",
+                entry.index_block_hash
+            );
+            process::exit(1);
+        });
+
+        match &entry.source {
+            BlockSource::Nakamoto => {
+                let Some((block, _)) =
+                    nakamoto_conn
+                        .get_nakamoto_block(&block_id)
+                        .unwrap_or_else(|e| {
+                            eprintln!(
+                                "Failed to load Nakamoto block {} (height {}): {e:?}",
+                                entry.index_block_hash, entry.height
+                            );
+                            process::exit(1);
+                        })
+                else {
+                    eprintln!(
+                        "No block data found for {} (height {}), skipping",
+                        entry.index_block_hash, entry.height
+                    );
+                    continue;
+                };
+
+                for tx in block.txs.iter() {
+                    if let TransactionPayload::SmartContract(_, version_opt) = &tx.payload {
+                        if let Some(version) = version_opt {
+                            if *version == clarity_version {
+                                offending.push((
+                                    entry.height,
+                                    entry.index_block_hash.clone(),
+                                    tx.txid().to_hex(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            BlockSource::Epoch2 {
+                consensus_hash,
+                anchored_block_hash,
+            } => {
+                let block_bytes = match StacksChainState::load_block_bytes(
+                    &blocks_path,
+                    consensus_hash,
+                    anchored_block_hash,
+                ) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => {
+                        eprintln!(
+                            "Block {} (height {}) has no stored data, skipping",
+                            entry.index_block_hash, entry.height
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Failed to load epoch2 block {} (height {}): {e:?}",
+                            entry.index_block_hash, entry.height
+                        );
+                        process::exit(1);
+                    }
+                };
+
+                let block = StacksBlock::consensus_deserialize(&mut &block_bytes[..])
+                    .unwrap_or_else(|e| {
+                        eprintln!(
+                            "Failed to deserialize epoch2 block {} (height {}): {e:?}",
+                            entry.index_block_hash, entry.height
+                        );
+                        process::exit(1);
+                    });
+
+                for tx in block.txs.iter() {
+                    if let TransactionPayload::SmartContract(_, version_opt) = &tx.payload {
+                        if let Some(version) = version_opt {
+                            if *version == clarity_version {
+                                offending.push((
+                                    entry.height,
+                                    entry.index_block_hash.clone(),
+                                    tx.txid().to_hex(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    print!("\rProgress: 100% ({}/{})\n", total_blocks, total_blocks);
+
+    if offending.is_empty() {
+        println!(
+            "Checked {total_blocks} blocks between heights {actual_start} and {actual_end}. \
+             No contract deployments used Clarity version {}.",
+            clarity_version.to_string()
+        );
+        return;
+    }
+
+    eprintln!(
+        "Found {} contract deployment(s) using Clarity version {} between heights {actual_start} and {actual_end}:",
+        offending.len(),
+        clarity_version.to_string()
+    );
+    for (height, index_hash, txid) in offending.iter() {
+        eprintln!("  height {height}, index {index_hash}, txid {txid}");
+    }
+    process::exit(1);
 }
 
 /// Replay blocks from chainstate database
