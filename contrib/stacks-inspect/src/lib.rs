@@ -14,6 +14,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::HashSet;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 use std::{fs, process};
@@ -22,7 +23,7 @@ use clarity::types::chainstate::SortitionId;
 use clarity::util::hash::{Sha512Trunc256Sum, to_hex};
 use clarity::vm::ClarityVersion;
 use regex::Regex;
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags};
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId};
 use stacks_common::types::sqlite::NO_PARAMS;
@@ -52,6 +53,196 @@ use stackslib::core::*;
 use stackslib::cost_estimates::UnitEstimator;
 use stackslib::cost_estimates::metrics::UnitMetric;
 use stackslib::util_lib::db::IndexDBTx;
+
+#[derive(Clone)]
+enum BlockSource {
+    Nakamoto,
+    Epoch2 {
+        consensus_hash: ConsensusHash,
+        anchored_block_hash: BlockHeaderHash,
+    },
+}
+
+#[derive(Clone)]
+struct BlockScanEntry {
+    height: u64,
+    index_block_hash: String,
+    source: BlockSource,
+}
+
+enum BlockSelection {
+    All,
+    Prefix(String),
+    First(u64),
+    Last(u64),
+    HeightRange { start: u64, end: u64 },
+    IndexRange { start: u64, end: u64 },
+}
+
+impl BlockSelection {
+    fn clause(&self) -> String {
+        match self {
+            BlockSelection::All => "WHERE orphaned = 0 ORDER BY height ASC".into(),
+            BlockSelection::Prefix(prefix) => format!(
+                "WHERE orphaned = 0 AND index_block_hash LIKE \"{}%\" ORDER BY height ASC",
+                prefix
+            ),
+            BlockSelection::First(count) => {
+                format!("WHERE orphaned = 0 ORDER BY height ASC LIMIT {count}")
+            }
+            BlockSelection::Last(count) => {
+                format!("WHERE orphaned = 0 ORDER BY height DESC LIMIT {count}")
+            }
+            BlockSelection::HeightRange { start, end } => format!(
+                "WHERE orphaned = 0 AND height BETWEEN {start} AND {end} ORDER BY height ASC"
+            ),
+            BlockSelection::IndexRange { start, end } => {
+                let blocks = end.saturating_sub(*start);
+                format!("WHERE orphaned = 0 ORDER BY index_block_hash ASC LIMIT {start}, {blocks}")
+            }
+        }
+    }
+}
+
+fn parse_block_selection(mode: Option<&str>, argv: &[String]) -> Result<BlockSelection, String> {
+    match mode {
+        Some("prefix") => {
+            let prefix = argv
+                .get(3)
+                .ok_or_else(|| "Missing <index-block-hash-prefix>".to_string())?
+                .clone();
+            Ok(BlockSelection::Prefix(prefix))
+        }
+        Some("first") => {
+            let count = argv
+                .get(3)
+                .ok_or_else(|| "Missing <block-count>".to_string())?
+                .parse::<u64>()
+                .map_err(|_| "<block-count> must be a u64".to_string())?;
+            Ok(BlockSelection::First(count))
+        }
+        Some("last") => {
+            let count = argv
+                .get(3)
+                .ok_or_else(|| "Missing <block-count>".to_string())?
+                .parse::<u64>()
+                .map_err(|_| "<block-count> must be a u64".to_string())?;
+            Ok(BlockSelection::Last(count))
+        }
+        Some("range") => {
+            let start = argv
+                .get(3)
+                .ok_or_else(|| "Missing <start-block>".to_string())?
+                .parse::<u64>()
+                .map_err(|_| "<start-block> must be a u64".to_string())?;
+            let end = argv
+                .get(4)
+                .ok_or_else(|| "Missing <end-block>".to_string())?
+                .parse::<u64>()
+                .map_err(|_| "<end-block> must be a u64".to_string())?;
+            if start > end {
+                return Err("<start-block> must be <= <end-block>".into());
+            }
+            Ok(BlockSelection::HeightRange { start, end })
+        }
+        Some("index-range") => {
+            let start = argv
+                .get(3)
+                .ok_or_else(|| "Missing <start-block>".to_string())?
+                .parse::<u64>()
+                .map_err(|_| "<start-block> must be a u64".to_string())?;
+            let end = argv
+                .get(4)
+                .ok_or_else(|| "Missing <end-block>".to_string())?
+                .parse::<u64>()
+                .map_err(|_| "<end-block> must be a u64".to_string())?;
+            if start > end {
+                return Err("<start-block> must be <= <end-block>".into());
+            }
+            Ok(BlockSelection::IndexRange { start, end })
+        }
+        Some(other) => Err(format!("Unrecognized option: {other}")),
+        None => Ok(BlockSelection::All),
+    }
+}
+
+fn collect_block_entries_for_selection(
+    db_path: &str,
+    selection: &BlockSelection,
+    chainstate: &StacksChainState,
+) -> Vec<BlockScanEntry> {
+    let mut seen = HashSet::new();
+    let mut entries = Vec::new();
+    let clause = selection.clause();
+
+    let staging_blocks_db_path = format!("{db_path}/chainstate/vm/index.sqlite");
+    let conn =
+        Connection::open_with_flags(&staging_blocks_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap_or_else(|e| {
+                panic!("Failed to open staging blocks DB at {staging_blocks_db_path}: {e}");
+            });
+    let sql = format!(
+        "SELECT index_block_hash, consensus_hash, anchored_block_hash, height FROM staging_blocks {clause}"
+    );
+    let mut stmt = conn.prepare(&sql).unwrap_or_else(|e| {
+        panic!("Failed to prepare query over staging_blocks: {e}");
+    });
+    let mut rows = stmt.query(NO_PARAMS).unwrap_or_else(|e| {
+        panic!("Failed to query staging_blocks: {e}");
+    });
+    while let Some(row) = rows.next().unwrap_or_else(|e| {
+        panic!("Failed to read staging block row: {e}");
+    }) {
+        let index_block_hash: String = row.get(0).unwrap();
+        if !seen.insert(index_block_hash.clone()) {
+            continue;
+        }
+        let consensus_hex: String = row.get(1).unwrap();
+        let anchored_hex: String = row.get(2).unwrap();
+        let height: u64 = row.get(3).unwrap();
+        let consensus_hash = ConsensusHash::from_hex(&consensus_hex).unwrap_or_else(|_| {
+            panic!("Failed to parse consensus hash {consensus_hex} for block {index_block_hash}");
+        });
+        let anchored_block_hash = BlockHeaderHash::from_hex(&anchored_hex).unwrap_or_else(|_| {
+            panic!(
+                "Failed to parse anchored block hash {anchored_hex} for block {index_block_hash}"
+            );
+        });
+        entries.push(BlockScanEntry {
+            height,
+            index_block_hash,
+            source: BlockSource::Epoch2 {
+                consensus_hash,
+                anchored_block_hash,
+            },
+        });
+    }
+
+    let sql = format!("SELECT index_block_hash, height FROM nakamoto_staging_blocks {clause}");
+    let conn = chainstate.nakamoto_blocks_db();
+    let mut stmt = conn.prepare(&sql).unwrap_or_else(|e| {
+        panic!("Failed to prepare query over nakamoto_staging_blocks: {e}");
+    });
+    let mut rows = stmt.query(NO_PARAMS).unwrap_or_else(|e| {
+        panic!("Failed to query nakamoto_staging_blocks: {e}");
+    });
+    while let Some(row) = rows.next().unwrap_or_else(|e| {
+        panic!("Failed to read Nakamoto staging block row: {e}");
+    }) {
+        let index_block_hash: String = row.get(0).unwrap();
+        if !seen.insert(index_block_hash.clone()) {
+            continue;
+        }
+        let height: u64 = row.get(1).unwrap();
+        entries.push(BlockScanEntry {
+            height,
+            index_block_hash,
+            source: BlockSource::Nakamoto,
+        });
+    }
+
+    entries
+}
 
 /// Options common to many `stacks-inspect` subcommands
 /// Returned by `process_common_opts()`
@@ -134,70 +325,68 @@ pub fn command_validate_block(argv: &[String], conf: Option<&Config>) {
         eprintln!("  {n} <database-path> <first|last> <block-count>");
         process::exit(1);
     };
+
     let start = Instant::now();
     let db_path = argv.get(1).unwrap_or_else(|| print_help_and_exit());
     let mode = argv.get(2).map(String::as_str);
-    let staging_blocks_db_path = format!("{db_path}/chainstate/vm/index.sqlite");
-    let conn =
-        Connection::open_with_flags(&staging_blocks_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .unwrap();
+    let selection = parse_block_selection(mode, argv).unwrap_or_else(|err| {
+        eprintln!("{err}");
+        print_help_and_exit();
+    });
 
-    let query = match mode {
-        Some("prefix") => format!(
-            "SELECT index_block_hash FROM staging_blocks WHERE orphaned = 0 AND index_block_hash LIKE \"{}%\"",
-            argv[3]
-        ),
-        Some("first") => format!(
-            "SELECT index_block_hash FROM staging_blocks WHERE orphaned = 0 ORDER BY height ASC LIMIT {}",
-            argv[3]
-        ),
-        Some("range") => {
-            let arg4 = argv[3]
-                .parse::<u64>()
-                .expect("<start_block> not a valid u64");
-            let arg5 = argv[4].parse::<u64>().expect("<end-block> not a valid u64");
-            let start = arg4.saturating_sub(1);
-            let blocks = arg5.saturating_sub(arg4);
-            format!(
-                "SELECT index_block_hash FROM staging_blocks WHERE orphaned = 0 ORDER BY height ASC LIMIT {start}, {blocks}"
-            )
-        }
-        Some("index-range") => {
-            let start = argv[3]
-                .parse::<u64>()
-                .expect("<start_block> not a valid u64");
-            let end = argv[4].parse::<u64>().expect("<end-block> not a valid u64");
-            let blocks = end.saturating_sub(start);
-            format!(
-                "SELECT index_block_hash FROM staging_blocks WHERE orphaned = 0 ORDER BY index_block_hash ASC LIMIT {start}, {blocks}"
-            )
-        }
-        Some("last") => format!(
-            "SELECT index_block_hash FROM staging_blocks WHERE orphaned = 0 ORDER BY height DESC LIMIT {}",
-            argv[3]
-        ),
-        Some(_) => print_help_and_exit(),
-        // Default to ALL blocks
-        None => "SELECT index_block_hash FROM staging_blocks WHERE orphaned = 0".into(),
-    };
+    let conf = conf.unwrap_or(&DEFAULT_MAINNET_CONFIG);
+    let chain_state_path = format!("{db_path}/chainstate/");
+    let (chainstate, _) = StacksChainState::open(
+        conf.is_mainnet(),
+        conf.burnchain.chain_id,
+        &chain_state_path,
+        None,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Failed to open chainstate at {chain_state_path}: {e}");
+        process::exit(1);
+    });
 
-    let mut stmt = conn.prepare(&query).unwrap();
-    let mut hashes_set = stmt.query(NO_PARAMS).unwrap();
-
-    let mut index_block_hashes: Vec<String> = vec![];
-    while let Ok(Some(row)) = hashes_set.next() {
-        index_block_hashes.push(row.get(0).unwrap());
+    let work_items = collect_block_entries_for_selection(db_path, &selection, &chainstate);
+    drop(chainstate);
+    if work_items.is_empty() {
+        println!("No blocks matched the requested selection.");
+        return;
     }
 
-    let total = index_block_hashes.len();
-    println!("Will check {total} blocks");
-    for (i, index_block_hash) in index_block_hashes.iter().enumerate() {
-        if i % 100 == 0 {
-            println!("Checked {i}...");
+    let total_blocks = work_items.len();
+    let mut last_progress = usize::MAX;
+    for (idx, entry) in work_items.iter().enumerate() {
+        let pct = (((idx + 1) as f32 / total_blocks as f32) * 100.0).floor() as usize;
+        if pct != last_progress {
+            print!("\rValidating: {:>3}% ({}/{})", pct, idx + 1, total_blocks);
+            io::stdout().flush().ok();
+            last_progress = pct;
         }
-        replay_staging_block(db_path, index_block_hash, conf);
+
+        match entry.source {
+            BlockSource::Nakamoto => {
+                if let Err(e) =
+                    replay_naka_staging_block(db_path, &entry.index_block_hash, Some(conf))
+                {
+                    println!(
+                        "Failed to validate Nakamoto block {}: {e:?}",
+                        entry.index_block_hash
+                    );
+                }
+            }
+            BlockSource::Epoch2 { .. } => {
+                if let Err(e) = replay_staging_block(db_path, &entry.index_block_hash, Some(conf)) {
+                    println!("Failed to validate block {}: {e:?}", entry.index_block_hash);
+                }
+            }
+        }
     }
-    println!("Finished. run_time_seconds = {}", start.elapsed().as_secs());
+    println!(
+        "\nFinished validating {} blocks in {}s",
+        total_blocks,
+        start.elapsed().as_secs()
+    );
 }
 
 /// Scan a range of Stacks blocks for contract deployments using a specific Clarity version
@@ -267,124 +456,17 @@ pub fn command_check_clarity_version(argv: &[String], conf: Option<&Config>) {
         eprintln!("Failed to open chainstate at {chain_state_path}: {e}");
         process::exit(1);
     });
-    #[derive(Clone)]
-    enum BlockSource {
-        Nakamoto,
-        Epoch2 {
-            consensus_hash: ConsensusHash,
-            anchored_block_hash: BlockHeaderHash,
-        },
-    }
-
-    #[derive(Clone)]
-    struct BlockScanEntry {
-        height: u64,
-        index_block_hash: String,
-        source: BlockSource,
-    }
-
     let blocks_path = chainstate.blocks_path.clone();
-    let mut work_items: Vec<BlockScanEntry> = Vec::new();
-    let mut seen_index_hashes: HashSet<String> = HashSet::new();
-
-    {
-        let staging_conn = chainstate.nakamoto_blocks_db();
-        let mut stmt = staging_conn
-            .prepare(
-                "SELECT index_block_hash, height FROM nakamoto_staging_blocks \
-                 WHERE orphaned = 0 AND height BETWEEN ?1 AND ?2 ORDER BY height ASC",
-            )
-            .unwrap_or_else(|e| {
-                eprintln!("Failed to prepare query over nakamoto_staging_blocks: {e}");
-                process::exit(1);
-            });
-        let mut rows = stmt
-            .query(params![start_height, end_height])
-            .unwrap_or_else(|e| {
-                eprintln!("Failed to query nakamoto_staging_blocks: {e}");
-                process::exit(1);
-            });
-
-        while let Some(row) = rows.next().unwrap_or_else(|e| {
-            eprintln!("Failed to read staging block row: {e}");
-            process::exit(1);
-        }) {
-            let index_block_hash: String = row.get(0).unwrap();
-            let height: u64 = row.get(1).unwrap();
-            if seen_index_hashes.insert(index_block_hash.clone()) {
-                work_items.push(BlockScanEntry {
-                    height,
-                    index_block_hash,
-                    source: BlockSource::Nakamoto,
-                });
-            }
-        }
-    }
-
-    {
-        let staging_db_path = format!("{db_path}/chainstate/vm/index.sqlite");
-        let conn = Connection::open_with_flags(&staging_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .unwrap_or_else(|e| {
-                eprintln!("Failed to open staging blocks DB at {staging_db_path}: {e}");
-                process::exit(1);
-            });
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT index_block_hash, consensus_hash, anchored_block_hash, height FROM staging_blocks \
-                 WHERE orphaned = 0 AND height BETWEEN ?1 AND ?2 ORDER BY height ASC",
-            )
-            .unwrap_or_else(|e| {
-                eprintln!("Failed to prepare query over staging_blocks: {e}");
-                process::exit(1);
-            });
-        let mut rows = stmt
-            .query(params![start_height, end_height])
-            .unwrap_or_else(|e| {
-                eprintln!("Failed to query staging_blocks: {e}");
-                process::exit(1);
-            });
-
-        while let Some(row) = rows.next().unwrap_or_else(|e| {
-            eprintln!("Failed to read epoch2 staging block row: {e}");
-            process::exit(1);
-        }) {
-            let index_block_hash: String = row.get(0).unwrap();
-            if !seen_index_hashes.insert(index_block_hash.clone()) {
-                continue;
-            }
-            let consensus_hex: String = row.get(1).unwrap();
-            let anchored_hex: String = row.get(2).unwrap();
-            let height: u64 = row.get(3).unwrap();
-            let consensus_hash = ConsensusHash::from_hex(&consensus_hex).unwrap_or_else(|_| {
-                eprintln!(
-                    "Failed to parse consensus hash {consensus_hex} for block {index_block_hash}"
-                );
-                process::exit(1);
-            });
-            let anchored_block_hash = BlockHeaderHash::from_hex(&anchored_hex).unwrap_or_else(|_| {
-                eprintln!(
-                    "Failed to parse anchored block hash {anchored_hex} for block {index_block_hash}"
-                );
-                process::exit(1);
-            });
-            work_items.push(BlockScanEntry {
-                height,
-                index_block_hash,
-                source: BlockSource::Epoch2 {
-                    consensus_hash,
-                    anchored_block_hash,
-                },
-            });
-        }
-    }
+    let selection = BlockSelection::HeightRange {
+        start: start_height,
+        end: end_height,
+    };
+    let work_items = collect_block_entries_for_selection(db_path, &selection, &chainstate);
 
     if work_items.is_empty() {
         println!("No blocks found between heights {start_height} and {end_height}.");
         return;
     }
-
-    work_items.sort_by_key(|entry| entry.height);
 
     let total_blocks = work_items.len() as u64;
     let actual_start = work_items.first().map(|b| b.height).unwrap_or(start_height);
@@ -400,8 +482,7 @@ pub fn command_check_clarity_version(argv: &[String], conf: Option<&Config>) {
         let progress = ((idx as f32 / total_blocks_f32) * 100.0).floor() as usize;
         if progress != last_rendered {
             print!("\rProgress: {:>3}% ({}/{})", progress, idx, total_blocks);
-            use std::io::{Write, stdout};
-            stdout().flush().ok();
+            io::stdout().flush().ok();
             last_rendered = progress;
         }
 
@@ -518,98 +599,6 @@ pub fn command_check_clarity_version(argv: &[String], conf: Option<&Config>) {
         eprintln!("  height {height}, index {index_hash}, txid {txid}");
     }
     process::exit(1);
-}
-
-/// Replay blocks from chainstate database
-/// Terminates on error using `process::exit()`
-///
-/// Arguments:
-///  - `argv`: Args in CLI format: `<command-name> [args...]`
-pub fn command_validate_block_nakamoto(argv: &[String], conf: Option<&Config>) {
-    let print_help_and_exit = || -> ! {
-        let n = &argv[0];
-        eprintln!("Usage:");
-        eprintln!("  {n} <database-path>");
-        eprintln!("  {n} <database-path> prefix <index-block-hash-prefix>");
-        eprintln!("  {n} <database-path> index-range <start-block> <end-block>");
-        eprintln!("  {n} <database-path> range <start-block> <end-block>");
-        eprintln!("  {n} <database-path> <first|last> <block-count>");
-        process::exit(1);
-    };
-    let start = Instant::now();
-    let db_path = argv.get(1).unwrap_or_else(|| print_help_and_exit());
-    let mode = argv.get(2).map(String::as_str);
-
-    let chain_state_path = format!("{db_path}/chainstate/");
-
-    let conf = conf.unwrap_or(&DEFAULT_MAINNET_CONFIG);
-
-    let (chainstate, _) = StacksChainState::open(
-        conf.is_mainnet(),
-        conf.burnchain.chain_id,
-        &chain_state_path,
-        None,
-    )
-    .unwrap();
-
-    let conn = chainstate.nakamoto_blocks_db();
-
-    let query = match mode {
-        Some("prefix") => format!(
-            "SELECT index_block_hash FROM nakamoto_staging_blocks WHERE orphaned = 0 AND index_block_hash LIKE \"{}%\"",
-            argv[3]
-        ),
-        Some("first") => format!(
-            "SELECT index_block_hash FROM nakamoto_staging_blocks WHERE orphaned = 0 ORDER BY height ASC LIMIT {}",
-            argv[3]
-        ),
-        Some("range") => {
-            let arg4 = argv[3]
-                .parse::<u64>()
-                .expect("<start_block> not a valid u64");
-            let arg5 = argv[4].parse::<u64>().expect("<end-block> not a valid u64");
-            let start = arg4.saturating_sub(1);
-            let blocks = arg5.saturating_sub(arg4);
-            format!(
-                "SELECT index_block_hash FROM nakamoto_staging_blocks WHERE orphaned = 0 ORDER BY height ASC LIMIT {start}, {blocks}"
-            )
-        }
-        Some("index-range") => {
-            let start = argv[3]
-                .parse::<u64>()
-                .expect("<start_block> not a valid u64");
-            let end = argv[4].parse::<u64>().expect("<end-block> not a valid u64");
-            let blocks = end.saturating_sub(start);
-            format!(
-                "SELECT index_block_hash FROM nakamoto_staging_blocks WHERE orphaned = 0 ORDER BY index_block_hash ASC LIMIT {start}, {blocks}"
-            )
-        }
-        Some("last") => format!(
-            "SELECT index_block_hash FROM nakamoto_staging_blocks WHERE orphaned = 0 ORDER BY height DESC LIMIT {}",
-            argv[3]
-        ),
-        Some(_) => print_help_and_exit(),
-        // Default to ALL blocks
-        None => "SELECT index_block_hash FROM nakamoto_staging_blocks WHERE orphaned = 0".into(),
-    };
-
-    let mut stmt = conn.prepare(&query).unwrap();
-    let mut hashes_set = stmt.query(NO_PARAMS).unwrap();
-
-    let mut index_block_hashes: Vec<String> = vec![];
-    while let Ok(Some(row)) = hashes_set.next() {
-        index_block_hashes.push(row.get(0).unwrap());
-    }
-
-    let total = index_block_hashes.len();
-    println!("Will check {total} blocks");
-    for (i, index_block_hash) in index_block_hashes.iter().enumerate() {
-        if i % 100 == 0 {
-            println!("Checked {i}...");
-        }
-        replay_naka_staging_block(db_path, index_block_hash, conf);
-    }
-    println!("Finished. run_time_seconds = {}", start.elapsed().as_secs());
 }
 
 /// Replay mock mined blocks from JSON files
@@ -906,8 +895,13 @@ pub fn command_contract_hash(argv: &[String], _conf: Option<&Config>) {
 }
 
 /// Fetch and process a `StagingBlock` from database and call `replay_block()` to validate
-fn replay_staging_block(db_path: &str, index_block_hash_hex: &str, conf: Option<&Config>) {
-    let block_id = StacksBlockId::from_hex(index_block_hash_hex).unwrap();
+fn replay_staging_block(
+    db_path: &str,
+    index_block_hash_hex: &str,
+    conf: Option<&Config>,
+) -> Result<(), String> {
+    let block_id = StacksBlockId::from_hex(index_block_hash_hex)
+        .map_err(|e| format!("Invalid block hash {index_block_hash_hex}: {e}"))?;
     let chain_state_path = format!("{db_path}/chainstate/");
     let sort_db_path = format!("{db_path}/burnchain/sortition");
 
@@ -919,7 +913,7 @@ fn replay_staging_block(db_path: &str, index_block_hash_hex: &str, conf: Option<
         &chain_state_path,
         None,
     )
-    .unwrap();
+    .map_err(|e| format!("Failed to open chainstate at {chain_state_path}: {e:?}"))?;
 
     let burnchain = conf.get_burnchain();
     let epochs = conf.burnchain.get_epoch_list();
@@ -933,41 +927,39 @@ fn replay_staging_block(db_path: &str, index_block_hash_hex: &str, conf: Option<
         None,
         true,
     )
-    .unwrap();
+    .map_err(|e| format!("Failed to open sortition DB at {sort_db_path}: {e:?}"))?;
     let sort_tx = sortdb.tx_begin_at_tip();
 
     let blocks_path = chainstate.blocks_path.clone();
-    let (mut chainstate_tx, clarity_instance) = chainstate
+    let (mut chainstate_tx, mut clarity_instance) = chainstate
         .chainstate_tx_begin()
-        .expect("Failed to start chainstate tx");
+        .map_err(|e| format!("{e:?}"))?;
     let mut next_staging_block =
         StacksChainState::load_staging_block_info(&chainstate_tx.tx, &block_id)
-            .expect("Failed to load staging block data")
-            .expect("No such index block hash in block database");
+            .map_err(|e| format!("Failed to load staging block info: {e:?}"))?
+            .ok_or_else(|| "No such index block hash in block database".to_string())?;
 
     next_staging_block.block_data = StacksChainState::load_block_bytes(
         &blocks_path,
         &next_staging_block.consensus_hash,
         &next_staging_block.anchored_block_hash,
     )
-    .unwrap()
+    .map_err(|e| format!("Failed to load block bytes: {e:?}"))?
     .unwrap_or_default();
 
-    let Some(parent_header_info) =
-        StacksChainState::get_parent_header_info(&mut chainstate_tx, &next_staging_block).unwrap()
-    else {
-        println!("Failed to load parent head info for block: {index_block_hash_hex}");
-        return;
-    };
+    let parent_header_info =
+        StacksChainState::get_parent_header_info(&mut chainstate_tx, &next_staging_block)
+            .map_err(|e| format!("Failed to get parent header info: {e:?}"))?
+            .ok_or_else(|| "Missing parent header info".to_string())?;
 
-    let block =
-        StacksChainState::extract_stacks_block(&next_staging_block).expect("Failed to get block");
+    let block = StacksChainState::extract_stacks_block(&next_staging_block)
+        .map_err(|e| format!("{e:?}"))?;
     let block_size = next_staging_block.block_data.len() as u64;
 
     replay_block(
         sort_tx,
         chainstate_tx,
-        clarity_instance,
+        &mut clarity_instance,
         &parent_header_info,
         &next_staging_block.parent_microblock_hash,
         next_staging_block.parent_microblock_seq,
@@ -979,6 +971,7 @@ fn replay_staging_block(db_path: &str, index_block_hash_hex: &str, conf: Option<
         next_staging_block.commit_burn,
         next_staging_block.sortition_burn,
     );
+    Ok(())
 }
 
 /// Process a mock mined block and call `replay_block()` to validate
@@ -1051,6 +1044,50 @@ fn replay_mock_mined_block(db_path: &str, block: AssembledAnchorBlock, conf: Opt
         0,
         0,
     );
+}
+
+fn replay_naka_staging_block(
+    db_path: &str,
+    index_block_hash_hex: &str,
+    conf: Option<&Config>,
+) -> Result<(), String> {
+    let block_id = StacksBlockId::from_hex(index_block_hash_hex)
+        .map_err(|e| format!("Invalid block hash {index_block_hash_hex}: {e}"))?;
+    let chain_state_path = format!("{db_path}/chainstate/");
+    let sort_db_path = format!("{db_path}/burnchain/sortition");
+
+    let conf = conf.unwrap_or(&DEFAULT_MAINNET_CONFIG);
+
+    let (mut chainstate, _) = StacksChainState::open(
+        conf.is_mainnet(),
+        conf.burnchain.chain_id,
+        &chain_state_path,
+        None,
+    )
+    .map_err(|e| format!("Failed to open chainstate: {e:?}"))?;
+
+    let burnchain = conf.get_burnchain();
+    let epochs = conf.burnchain.get_epoch_list();
+    let mut sortdb = SortitionDB::connect(
+        &sort_db_path,
+        burnchain.first_block_height,
+        &burnchain.first_block_hash,
+        u64::from(burnchain.first_block_timestamp),
+        &epochs,
+        burnchain.pox_constants.clone(),
+        None,
+        true,
+    )
+    .map_err(|e| format!("Failed to open sortition DB: {e:?}"))?;
+
+    let (block, block_size) = chainstate
+        .nakamoto_blocks_db()
+        .get_nakamoto_block(&block_id)
+        .map_err(|e| format!("Failed to load Nakamoto block: {e:?}"))?
+        .ok_or_else(|| "No block data found".to_string())?;
+
+    replay_block_nakamoto(&mut sortdb, &mut chainstate, &block, block_size)
+        .map_err(|e| format!("Failed to validate Nakamoto block: {e:?}"))
 }
 
 /// Validate a block against chainstate
@@ -1189,41 +1226,6 @@ fn replay_block(
 }
 
 /// Fetch and process a NakamotoBlock from database and call `replay_block_nakamoto()` to validate
-fn replay_naka_staging_block(db_path: &str, index_block_hash_hex: &str, conf: &Config) {
-    let block_id = StacksBlockId::from_hex(index_block_hash_hex).unwrap();
-    let chain_state_path = format!("{db_path}/chainstate/");
-    let sort_db_path = format!("{db_path}/burnchain/sortition");
-
-    let (mut chainstate, _) = StacksChainState::open(
-        conf.is_mainnet(),
-        conf.burnchain.chain_id,
-        &chain_state_path,
-        None,
-    )
-    .unwrap();
-
-    let burnchain = conf.get_burnchain();
-    let epochs = conf.burnchain.get_epoch_list();
-    let mut sortdb = SortitionDB::connect(
-        &sort_db_path,
-        burnchain.first_block_height,
-        &burnchain.first_block_hash,
-        u64::from(burnchain.first_block_timestamp),
-        &epochs,
-        burnchain.pox_constants.clone(),
-        None,
-        true,
-    )
-    .unwrap();
-
-    let (block, block_size) = chainstate
-        .nakamoto_blocks_db()
-        .get_nakamoto_block(&block_id)
-        .unwrap()
-        .unwrap();
-    replay_block_nakamoto(&mut sortdb, &mut chainstate, &block, block_size).unwrap();
-}
-
 fn replay_block_nakamoto(
     sort_db: &mut SortitionDB,
     stacks_chain_state: &mut StacksChainState,
