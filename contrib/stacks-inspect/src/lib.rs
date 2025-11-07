@@ -323,13 +323,21 @@ pub fn command_validate_block(argv: &[String], conf: Option<&Config>) {
         eprintln!("  {n} <database-path> index-range <start-block> <end-block>");
         eprintln!("  {n} <database-path> range <start-block> <end-block>");
         eprintln!("  {n} <database-path> <first|last> <block-count>");
+        eprintln!("  {n} --early-exit ... # Exit on first error found");
         process::exit(1);
     };
 
     let start = Instant::now();
-    let db_path = argv.get(1).unwrap_or_else(|| print_help_and_exit());
-    let mode = argv.get(2).map(String::as_str);
-    let selection = parse_block_selection(mode, argv).unwrap_or_else(|err| {
+    let mut args = argv.to_vec();
+    let early_exit = if let Some("--early-exit") = args.get(1).map(String::as_str) {
+        args.remove(1);
+        true
+    } else {
+        false
+    };
+    let db_path = args.get(1).unwrap_or_else(|| print_help_and_exit());
+    let mode = args.get(2).map(String::as_str);
+    let selection = parse_block_selection(mode, &args).unwrap_or_else(|err| {
         eprintln!("{err}");
         print_help_and_exit();
     });
@@ -355,6 +363,7 @@ pub fn command_validate_block(argv: &[String], conf: Option<&Config>) {
     }
 
     let total_blocks = work_items.len();
+    let mut errors_found = vec![];
     let mut last_progress = usize::MAX;
     for (idx, entry) in work_items.iter().enumerate() {
         let pct = (((idx + 1) as f32 / total_blocks as f32) * 100.0).floor() as usize;
@@ -373,14 +382,33 @@ pub fn command_validate_block(argv: &[String], conf: Option<&Config>) {
                         "Failed to validate Nakamoto block {}: {e:?}",
                         entry.index_block_hash
                     );
+                    if early_exit {
+                        process::exit(1);
+                    }
+                    errors_found.push(entry.index_block_hash.clone());
                 }
             }
             BlockSource::Epoch2 { .. } => {
                 if let Err(e) = replay_staging_block(db_path, &entry.index_block_hash, Some(conf)) {
                     println!("Failed to validate block {}: {e:?}", entry.index_block_hash);
+                    if early_exit {
+                        process::exit(1);
+                    }
+                    errors_found.push(entry.index_block_hash.clone());
                 }
             }
         }
+    }
+
+    if !errors_found.is_empty() {
+        println!(
+            "\nValidation completed with {} error(s) found:",
+            errors_found.len()
+        );
+        for hash in errors_found.iter() {
+            println!("  Block {}", hash);
+        }
+        process::exit(1);
     }
     println!(
         "\nFinished validating {} blocks in {}s",
