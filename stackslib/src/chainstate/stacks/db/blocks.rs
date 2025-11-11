@@ -4961,6 +4961,7 @@ impl StacksChainState {
         parent_microblocks: &[StacksMicroblock],
         mainnet: bool,
         miner_id_opt: Option<usize>,
+        do_not_advance: bool,
     ) -> Result<SetupBlockResult<'a, 'b>, Error> {
         let parent_index_hash = StacksBlockId::new(parent_consensus_hash, parent_header_hash);
         let parent_sortition_id = burn_dbconn
@@ -5014,15 +5015,27 @@ impl StacksChainState {
             ExecutionCost::ZERO
         };
 
-        let mut clarity_tx = StacksChainState::chainstate_block_begin(
-            chainstate_tx,
-            clarity_instance,
-            burn_dbconn,
-            parent_consensus_hash,
-            parent_header_hash,
-            &MINER_BLOCK_CONSENSUS_HASH,
-            &MINER_BLOCK_HEADER_HASH,
-        );
+        let mut clarity_tx = if do_not_advance {
+            StacksChainState::chainstate_ephemeral_block_begin(
+                chainstate_tx,
+                clarity_instance,
+                burn_dbconn,
+                parent_consensus_hash,
+                parent_header_hash,
+                &MINER_BLOCK_CONSENSUS_HASH,
+                &MINER_BLOCK_HEADER_HASH,
+            )
+        } else {
+            StacksChainState::chainstate_block_begin(
+                chainstate_tx,
+                clarity_instance,
+                burn_dbconn,
+                parent_consensus_hash,
+                parent_header_hash,
+                &MINER_BLOCK_CONSENSUS_HASH,
+                &MINER_BLOCK_HEADER_HASH,
+            )
+        };
 
         clarity_tx.reset_cost(parent_block_cost.clone());
 
@@ -5434,6 +5447,7 @@ impl StacksChainState {
             microblocks,
             mainnet,
             None,
+            do_not_advance,
         )?;
 
         let block_limit = clarity_tx.block_limit().unwrap_or_else(|| {

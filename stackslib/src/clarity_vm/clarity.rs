@@ -267,7 +267,7 @@ impl<'a, 'b> ClarityTransactionConnection<'a, 'b> {
 }
 
 pub struct ClarityReadOnlyConnection<'a> {
-    datastore: ReadOnlyMarfStore<'a>,
+    datastore: ReadOnlyMarfStore,
     header_db: &'a dyn HeadersDB,
     burn_state_db: &'a dyn BurnStateDB,
     epoch: StacksEpochId,

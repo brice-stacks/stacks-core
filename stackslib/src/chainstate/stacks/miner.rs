@@ -1977,6 +1977,7 @@ impl StacksBlockBuilder {
             &info.parent_microblocks,
             info.mainnet,
             Some(self.miner_id),
+            false,
         )?;
         self.miner_payouts = matured_miner_rewards_opt;
         self.total_confirmed_streamed_fees +=

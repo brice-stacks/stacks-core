@@ -282,6 +282,11 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
         if self.storage.readonly() {
             return Err(Error::ReadOnlyError);
         }
+        if self.storage.is_ephemeral() {
+            // For ephemeral storage, just clear ephemeral state
+            self.storage.clear_ephemeral();
+            return Ok(());
+        }
         if let Some(_tip) = self.open_chain_tip.take() {
             self.storage.flush()?;
         }
@@ -297,6 +302,11 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
         }
         if self.storage.unconfirmed() {
             return Err(Error::UnconfirmedError);
+        }
+        if self.storage.is_ephemeral() {
+            // For ephemeral storage, just clear ephemeral state
+            self.storage.clear_ephemeral();
+            return Ok(());
         }
         if let Some(_tip) = self.open_chain_tip.take() {
             self.storage.flush_to(real_bhh)?;
@@ -315,6 +325,11 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
         }
         if self.storage.unconfirmed() {
             return Err(Error::UnconfirmedError);
+        }
+        if self.storage.is_ephemeral() {
+            // For ephemeral storage, just clear ephemeral state
+            self.storage.clear_ephemeral();
+            return Ok(());
         }
         if let Some(_tip) = self.open_chain_tip.take() {
             self.storage.flush_mined(bhh)?;
@@ -397,6 +412,42 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
 
         let block_height = self.inner_get_extension_height(chain_tip, next_chain_tip)?;
         MARF::extend_trie(&mut self.storage, next_chain_tip)?;
+        self.inner_setup_extension(chain_tip, next_chain_tip, block_height, true)
+    }
+
+    pub fn begin_ephemeral(&mut self, chain_tip: &T, next_chain_tip: &T, block_height: u32) -> Result<(), Error> {
+        if self.storage.readonly() {
+            return Err(Error::ReadOnlyError);
+        }
+        if self.open_chain_tip.is_some() {
+            error!(
+                "MARF at {} is already in the process of writing",
+                &self.storage.db_path
+            );
+            return Err(Error::InProgressError);
+        }
+        if self.storage.has_block(next_chain_tip)? {
+            error!("Block data already exists: {}", next_chain_tip);
+            return Err(Error::ExistsError);
+        }
+
+        self.storage
+            .extend_to_block_ephemeral(chain_tip, next_chain_tip)?;
+        self.storage
+            .set_ephemeral(chain_tip, next_chain_tip, block_height);
+
+        if chain_tip == &T::sentinel() {
+            // no parent to copy from; synthesize the genesis root in RAM
+            let node = TrieNode256::new(&[]);
+            let hash = get_node_hash(&node, &[], self.storage.deref_mut());
+            let root_ptr = self.storage.root_ptr();
+            self.storage
+                .write_nodetype(root_ptr, &TrieNodeType::Node256(Box::new(node)), hash)?;
+        } else {
+            // mirror the parent trie root into the ephemeral buffer so reads can proceed
+            MARF::root_copy(&mut self.storage, chain_tip)?;
+        }
+
         self.inner_setup_extension(chain_tip, next_chain_tip, block_height, true)
     }
 

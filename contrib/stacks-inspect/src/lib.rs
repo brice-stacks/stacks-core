@@ -16,6 +16,8 @@
 use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::{fs, process};
 
@@ -164,6 +166,29 @@ fn parse_block_selection(mode: Option<&str>, argv: &[String]) -> Result<BlockSel
         Some(other) => Err(format!("Unrecognized option: {other}")),
         None => Ok(BlockSelection::All),
     }
+}
+
+fn extract_thread_count(args: &mut Vec<String>) -> Result<usize, String> {
+    let mut threads = 1;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--threads" {
+            if i + 1 >= args.len() {
+                return Err("--threads requires an argument".into());
+            }
+            let value = args[i + 1]
+                .parse::<usize>()
+                .map_err(|_| format!("Invalid thread count '{}'", args[i + 1]))?;
+            if value == 0 {
+                return Err("Thread count must be at least 1".into());
+            }
+            threads = value;
+            args.drain(i..=i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    Ok(threads)
 }
 
 fn collect_block_entries_for_selection(
@@ -324,6 +349,7 @@ pub fn command_validate_block(argv: &[String], conf: Option<&Config>) {
         eprintln!("  {n} <database-path> range <start-block> <end-block>");
         eprintln!("  {n} <database-path> <first|last> <block-count>");
         eprintln!("  {n} --early-exit ... # Exit on first error found");
+        eprintln!("  {n} --threads <N> ...");
         process::exit(1);
     };
 
@@ -335,6 +361,10 @@ pub fn command_validate_block(argv: &[String], conf: Option<&Config>) {
     } else {
         false
     };
+    let threads = extract_thread_count(&mut args).unwrap_or_else(|err| {
+        eprintln!("{err}");
+        print_help_and_exit();
+    });
     let db_path = args.get(1).unwrap_or_else(|| print_help_and_exit());
     let mode = args.get(2).map(String::as_str);
     let selection = parse_block_selection(mode, &args).unwrap_or_else(|err| {
@@ -342,7 +372,7 @@ pub fn command_validate_block(argv: &[String], conf: Option<&Config>) {
         print_help_and_exit();
     });
 
-    let conf = conf.unwrap_or(&DEFAULT_MAINNET_CONFIG);
+    let conf = Arc::new(conf.unwrap_or(&DEFAULT_MAINNET_CONFIG).clone());
     let chain_state_path = format!("{db_path}/chainstate/");
     let (chainstate, _) = StacksChainState::open(
         conf.is_mainnet(),
@@ -361,51 +391,90 @@ pub fn command_validate_block(argv: &[String], conf: Option<&Config>) {
         println!("No blocks matched the requested selection.");
         return;
     }
-
     let total_blocks = work_items.len();
-    let mut errors_found = vec![];
-    let mut last_progress = usize::MAX;
-    for (idx, entry) in work_items.iter().enumerate() {
-        let pct = (((idx + 1) as f32 / total_blocks as f32) * 100.0).floor() as usize;
-        if pct != last_progress {
-            print!("\rValidating: {:>3}% ({}/{})", pct, idx + 1, total_blocks);
-            io::stdout().flush().ok();
-            last_progress = pct;
-        }
 
-        match entry.source {
-            BlockSource::Nakamoto => {
-                if let Err(e) =
-                    replay_naka_staging_block(db_path, &entry.index_block_hash, Some(conf))
-                {
-                    println!(
-                        "Failed to validate Nakamoto block {}: {e:?}",
-                        entry.index_block_hash
-                    );
-                    if early_exit {
-                        process::exit(1);
+    let entries = Arc::new(work_items);
+    let next_index = Arc::new(AtomicUsize::new(0));
+    let progress = Arc::new(AtomicUsize::new(0));
+    let errors = Arc::new(Mutex::new(Vec::new()));
+    let mut handles = vec![];
+
+    const WORK_BATCH: usize = 8;
+
+    for _ in 0..threads {
+        let db_path = db_path.to_string();
+        let conf = conf.clone();
+        let entries = entries.clone();
+        let next_index = next_index.clone();
+        let progress = progress.clone();
+        let errors = errors.clone();
+        let handle = std::thread::spawn(move || {
+            loop {
+                let start = next_index.fetch_add(WORK_BATCH, Ordering::Relaxed);
+                if start >= entries.len() {
+                    break;
+                }
+                let end = (start + WORK_BATCH).min(entries.len());
+                for idx in start..end {
+                    let entry = &entries[idx];
+
+                    match &entry.source {
+                        BlockSource::Nakamoto => {
+                            if let Err(e) = replay_naka_staging_block(
+                                &db_path,
+                                &entry.index_block_hash,
+                                Some(&conf),
+                            ) {
+                                println!(
+                                    "Failed to validate Nakamoto block {}: {e:?}",
+                                    entry.index_block_hash
+                                );
+                                if early_exit {
+                                    process::exit(1);
+                                }
+                                let mut errs = errors.lock().unwrap();
+                                errs.push(entry.index_block_hash.clone());
+                            }
+                        }
+                        BlockSource::Epoch2 { .. } => {
+                            if let Err(e) =
+                                replay_staging_block(&db_path, &entry.index_block_hash, Some(&conf))
+                            {
+                                println!(
+                                    "Failed to validate block {}: {e:?}",
+                                    entry.index_block_hash
+                                );
+                                if early_exit {
+                                    process::exit(1);
+                                }
+                                let mut errs = errors.lock().unwrap();
+                                errs.push(entry.index_block_hash.clone());
+                            }
+                        }
                     }
-                    errors_found.push(entry.index_block_hash.clone());
+                    let completed = progress.fetch_add(1, Ordering::Relaxed) + 1;
+                    let pct = ((completed as f32 / total_blocks as f32) * 100.0).floor() as usize;
+                    print!("\rValidating: {:>3}% ({}/{})", pct, completed, total_blocks);
+                    io::stdout().flush().ok();
                 }
             }
-            BlockSource::Epoch2 { .. } => {
-                if let Err(e) = replay_staging_block(db_path, &entry.index_block_hash, Some(conf)) {
-                    println!("Failed to validate block {}: {e:?}", entry.index_block_hash);
-                    if early_exit {
-                        process::exit(1);
-                    }
-                    errors_found.push(entry.index_block_hash.clone());
-                }
-            }
-        }
+        });
+        handles.push(handle);
     }
 
-    if !errors_found.is_empty() {
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    print!("\rValidating: 100% ({}/{})\n", total_blocks, total_blocks);
+    let errors = errors.lock().unwrap();
+
+    if !errors.is_empty() {
         println!(
             "\nValidation completed with {} error(s) found:",
-            errors_found.len()
+            errors.len()
         );
-        for hash in errors_found.iter() {
+        for hash in errors.iter() {
             println!("  Block {}", hash);
         }
         process::exit(1);

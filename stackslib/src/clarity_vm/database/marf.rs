@@ -34,7 +34,6 @@ use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId, TrieHash};
 
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection, MarfTransaction, MARF};
-use crate::chainstate::stacks::index::storage::{TrieFileStorage, TrieHashCalculationMode};
 use crate::chainstate::stacks::index::{ClarityMarfTrieId, Error, MARFValue};
 use crate::clarity_vm::clarity::{
     ClarityMarfStore, ClarityMarfStoreTransaction, WritableMarfStore,
@@ -54,12 +53,6 @@ use crate::util_lib::db::{Error as DatabaseError, IndexDBConn};
 pub struct MarfedKV {
     chain_tip: StacksBlockId,
     marf: MARF<StacksBlockId>,
-    /// RAM-backed MARF that will be mutably referenced in an EphemeralMarfStore instance.
-    /// Due to limits in Rust's type system, it is necessary for this to be instantiated in
-    /// MarfedKV, since it must outlive EphemeralMarfStore, and MarfedKV is the "parent" of
-    /// all data referenced by ClarityMarfStore implementations (including the read-only and
-    /// persistent MARF stores).
-    ephemeral_marf: Option<MARF<StacksBlockId>>,
 }
 
 impl MarfedKV {
@@ -117,11 +110,7 @@ impl MarfedKV {
             None => StacksBlockId::sentinel(),
         };
 
-        Ok(MarfedKV {
-            marf,
-            chain_tip,
-            ephemeral_marf: None,
-        })
+        Ok(MarfedKV { marf, chain_tip })
     }
 
     pub fn open_unconfirmed(
@@ -135,11 +124,7 @@ impl MarfedKV {
             None => StacksBlockId::sentinel(),
         };
 
-        Ok(MarfedKV {
-            marf,
-            chain_tip,
-            ephemeral_marf: None,
-        })
+        Ok(MarfedKV { marf, chain_tip })
     }
 
     // used by benchmarks
@@ -168,19 +153,20 @@ impl MarfedKV {
 
         let chain_tip = StacksBlockId::sentinel();
 
-        MarfedKV {
-            marf,
-            chain_tip,
-            ephemeral_marf: None,
-        }
+        MarfedKV { marf, chain_tip }
     }
 
-    pub fn begin_read_only<'a>(
-        &'a mut self,
+    pub fn begin_read_only(
+        &mut self,
         at_block: Option<&StacksBlockId>,
-    ) -> ReadOnlyMarfStore<'a> {
+    ) -> ReadOnlyMarfStore {
+        let mut ro_marf = self
+            .marf
+            .reopen_readonly()
+            .unwrap_or_else(|e| panic!("ERROR: Failed to reopen MARF read-only view: {e:?}"));
+
         let chain_tip = if let Some(at_block) = at_block {
-            self.marf.open_block(at_block).unwrap_or_else(|e| {
+            ro_marf.open_block(at_block).unwrap_or_else(|e| {
                 error!(
                     "Failed to open read only connection at {}: {:?}",
                     at_block, &e
@@ -189,20 +175,33 @@ impl MarfedKV {
             });
             at_block.clone()
         } else {
+            ro_marf.open_block(&self.chain_tip).unwrap_or_else(|e| {
+                error!(
+                    "Failed to open read only connection at {}: {:?}",
+                    &self.chain_tip, &e
+                );
+                panic!()
+            });
             self.chain_tip.clone()
         };
+
         ReadOnlyMarfStore {
             chain_tip,
-            marf: &mut self.marf,
+            marf: ro_marf,
         }
     }
 
-    pub fn begin_read_only_checked<'a>(
-        &'a mut self,
+    pub fn begin_read_only_checked(
+        &mut self,
         at_block: Option<&StacksBlockId>,
-    ) -> InterpreterResult<ReadOnlyMarfStore<'a>> {
+    ) -> InterpreterResult<ReadOnlyMarfStore> {
+        let mut ro_marf = self
+            .marf
+            .reopen_readonly()
+            .map_err(|e| InterpreterError::MarfFailure(e.to_string()))?;
+
         let chain_tip = if let Some(at_block) = at_block {
-            self.marf.open_block(at_block).map_err(|e| {
+            ro_marf.open_block(at_block).map_err(|e| {
                 debug!(
                     "Failed to open read only connection at {}: {:?}",
                     at_block, &e
@@ -211,11 +210,19 @@ impl MarfedKV {
             })?;
             at_block.clone()
         } else {
+            ro_marf.open_block(&self.chain_tip).map_err(|e| {
+                debug!(
+                    "Failed to open read only connection at {}: {:?}",
+                    &self.chain_tip, &e
+                );
+                InterpreterError::MarfFailure(Error::NotFoundError.to_string())
+            })?;
             self.chain_tip.clone()
         };
+
         Ok(ReadOnlyMarfStore {
             chain_tip,
-            marf: &mut self.marf,
+            marf: ro_marf,
         })
     }
 
@@ -292,59 +299,22 @@ impl MarfedKV {
         ephemeral_next: &StacksBlockId,
     ) -> InterpreterResult<EphemeralMarfStore<'a>> {
         // sanity check -- `base_tip` must be mapped
-        self.marf.open_block(&base_tip).map_err(|e| {
-            debug!(
-                "Failed to open read only connection at {}: {:?}",
-                &base_tip, &e
-            );
-            InterpreterError::MarfFailure(Error::NotFoundError.to_string())
+        let mut read_only_marf = self.begin_read_only_checked(Some(base_tip))?;
+
+        let mut tx = self.marf.begin_tx().map_err(|e| {
+            InterpreterError::Expect(format!("Failed to open MARF tx for ephemeral block: {:?}", &e))
         })?;
 
-        // set up ephemeral MARF
-        let ephemeral_marf_storage = TrieFileStorage::open(
-            ":memory:",
-            MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", false),
-        )
-        .map_err(|e| {
-            InterpreterError::Expect(format!("Failed to instantiate ephemeral MARF: {:?}", &e))
-        })?;
-
-        let mut ephemeral_marf = MARF::from_storage(ephemeral_marf_storage);
-        let tx = ephemeral_marf
-            .storage_tx()
-            .map_err(|err| InterpreterError::DBError(err.to_string()))?;
-
-        SqliteConnection::initialize_conn(&tx)?;
-        tx.commit()
-            .map_err(|err| InterpreterError::SqliteError(IncomparableError { err }))?;
-
-        self.ephemeral_marf = Some(ephemeral_marf);
-
-        let read_only_marf = ReadOnlyMarfStore {
-            chain_tip: base_tip.clone(),
-            marf: &mut self.marf,
-        };
-
-        let Some(ephemeral_marf) = self.ephemeral_marf.as_mut() else {
-            // unreachable since self.ephemeral_marf is already assigned
-            unreachable!();
-        };
-
-        // attach the disk-backed MARF to the ephemeral MARF
-        EphemeralMarfStore::attach_read_only_marf(&ephemeral_marf, &read_only_marf).map_err(
-            |e| {
+        let block_height = read_only_marf
+            .get_current_block_height()
+            .checked_add(1)
+            .ok_or_else(|| {
                 InterpreterError::Expect(format!(
-                    "Failed to attach read-only MARF to ephemeral MARF: {:?}",
-                    &e
+                    "Failed to find block height for `{base_tip:?}`"
                 ))
-            },
-        )?;
+            })?;
 
-        let mut tx = ephemeral_marf.begin_tx().map_err(|e| {
-            InterpreterError::Expect(format!("Failed to open ephemeral MARF tx: {:?}", &e))
-        })?;
-
-        tx.begin(&StacksBlockId::sentinel(), ephemeral_next)
+        tx.begin_ephemeral(base_tip, ephemeral_next, block_height)
             .map_err(|e| {
                 InterpreterError::Expect(format!(
                     "Failed to begin first ephemeral MARF block: {:?}",
@@ -352,14 +322,14 @@ impl MarfedKV {
                 ))
             })?;
 
-        let ephemeral_marf_store = EphemeralMarfStore::new(read_only_marf, tx).map_err(|e| {
+        let store = EphemeralMarfStore::new(read_only_marf, tx).map_err(|e| {
             InterpreterError::Expect(format!(
                 "Failed to instantiate ephemeral MARF store: {:?}",
                 &e
             ))
         })?;
 
-        Ok(ephemeral_marf_store)
+        Ok(store)
     }
 
     pub fn get_chain_tip(&self) -> &StacksBlockId {
@@ -391,14 +361,14 @@ pub struct PersistentWritableMarfStore<'a> {
 
 /// A wrapper around a MARF handle which allows only read access to the MARF's keys off of a given
 /// chain tip.
-pub struct ReadOnlyMarfStore<'a> {
+pub struct ReadOnlyMarfStore {
     /// The chain tip from which reads will be indexed.
     chain_tip: StacksBlockId,
     /// Handle to the MARF being read
-    marf: &'a mut MARF<StacksBlockId>,
+    marf: MARF<StacksBlockId>,
 }
 
-impl ClarityMarfStore for ReadOnlyMarfStore<'_> {}
+impl ClarityMarfStore for ReadOnlyMarfStore {}
 impl ClarityMarfStore for PersistentWritableMarfStore<'_> {}
 
 impl ClarityMarfStoreTransaction for PersistentWritableMarfStore<'_> {
@@ -502,7 +472,7 @@ impl ClarityMarfStoreTransaction for PersistentWritableMarfStore<'_> {
     }
 }
 
-impl ReadOnlyMarfStore<'_> {
+impl ReadOnlyMarfStore {
     /// Determine if there is a trie in the underlying MARF with the given ID `bhh`.
     ///
     /// Return Ok(true) if so
@@ -530,7 +500,7 @@ impl ReadOnlyMarfStore<'_> {
     }
 }
 
-impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
+impl ClarityBackingStore for ReadOnlyMarfStore {
     fn get_side_store(&mut self) -> &Connection {
         self.marf.sqlite_conn()
     }

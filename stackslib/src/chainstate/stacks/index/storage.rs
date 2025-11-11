@@ -34,7 +34,7 @@ use crate::chainstate::stacks::index::bits::{
 };
 use crate::chainstate::stacks::index::cache::*;
 use crate::chainstate::stacks::index::file::{TrieFile, TrieFileNodeHashReader};
-use crate::chainstate::stacks::index::marf::MARFOpenOpts;
+use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MARF};
 #[cfg(test)]
 use crate::chainstate::stacks::index::node::set_backptr;
 use crate::chainstate::stacks::index::node::{
@@ -73,10 +73,20 @@ impl<T: MarfTrieId> BlockMap for TrieFileStorage<T> {
     }
 
     fn get_block_id(&self, block_hash: &T) -> Result<u32, Error> {
+        if let Some(meta) = self.data.ephemeral_meta.as_ref() {
+            if &meta.block_hash == block_hash {
+                return Ok(meta.block_id_hint);
+            }
+        }
         trie_sql::get_block_identifier(&self.db, block_hash)
     }
 
     fn get_block_id_caching(&mut self, block_hash: &T) -> Result<u32, Error> {
+        if let Some(meta) = self.data.ephemeral_meta.as_ref() {
+            if &meta.block_hash == block_hash {
+                return Ok(meta.block_id_hint);
+            }
+        }
         // don't use the cache if we're unconfirmed
         if self.data.unconfirmed {
             self.get_block_id(block_hash)
@@ -107,10 +117,20 @@ impl<T: MarfTrieId> BlockMap for TrieStorageConnection<'_, T> {
     }
 
     fn get_block_id(&self, block_hash: &T) -> Result<u32, Error> {
+        if let Some(meta) = self.data.ephemeral_meta.as_ref() {
+            if &meta.block_hash == block_hash {
+                return Ok(meta.block_id_hint);
+            }
+        }
         trie_sql::get_block_identifier(&self.db, block_hash)
     }
 
     fn get_block_id_caching(&mut self, block_hash: &T) -> Result<u32, Error> {
+        if let Some(meta) = self.data.ephemeral_meta.as_ref() {
+            if &meta.block_hash == block_hash {
+                return Ok(meta.block_id_hint);
+            }
+        }
         // don't use the cache if we're unconfirmed
         if self.data.unconfirmed {
             self.get_block_id(block_hash)
@@ -645,11 +665,14 @@ impl<T: MarfTrieId> TrieRAM<T> {
         if TrieHashCalculationMode::Deferred == storage_tx.deref().hash_calculation_mode
             || TrieHashCalculationMode::All == storage_tx.deref().hash_calculation_mode
         {
-            self.inner_seal_marf(storage_tx)
+            let marf_root_hash = self.inner_seal_marf(storage_tx)?;
+            storage_tx.set_ephemeral_root_hash(&marf_root_hash);
+            Ok(marf_root_hash)
         } else {
             // already available
             let marf_root_hash =
                 self.read_node_hash(&TriePtr::new(TrieNodeID::Node256 as u8, 0, 0))?;
+            storage_tx.set_ephemeral_root_hash(&marf_root_hash);
             Ok(marf_root_hash)
         }
     }
@@ -1248,6 +1271,23 @@ pub struct TrieStorageTransientData<T: MarfTrieId> {
 
     /// Does this trie represent unconfirmed state?
     unconfirmed: bool,
+
+    /// Is this an ephemeral trie?
+    pub ephemeral: bool,
+    /// Metadata for ephemeral tries
+    pub ephemeral_meta: Option<EphemeralBlockMeta<T>>,
+}
+
+/// Synthetic block id for ephemeral tries
+const EPHEMERAL_BLOCK_ID: u32 = u32::MAX;
+
+/// Metadata for an ephemeral trie
+pub struct EphemeralBlockMeta<T: MarfTrieId> {
+    pub block_hash: T,
+    pub parent_hash: T,
+    pub block_height: u32,
+    pub root_hash: Option<TrieHash>, // updated when seal() runs
+    pub block_id_hint: u32,
 }
 
 // disk-backed Trie.
@@ -1382,6 +1422,9 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
 
             readonly: true,
             unconfirmed: self.unconfirmed(),
+
+            ephemeral: false,
+            ephemeral_meta: None,
         };
         // perf note: should we attempt to clone the cache
         let cache = TrieCache::default();
@@ -1540,6 +1583,9 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
 
                 readonly,
                 unconfirmed,
+
+                ephemeral: false,
+                ephemeral_meta: None,
             },
 
             // used in testing in order to short-circuit block-height lookups
@@ -1629,6 +1675,9 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
 
                 readonly: true,
                 unconfirmed: self.unconfirmed(),
+
+                ephemeral: false,
+                ephemeral_meta: None,
             },
 
             // used in testing in order to short-circuit block-height lookups
@@ -1650,6 +1699,29 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
 
     pub fn reset_benchmarks(&mut self) {
         self.bench.reset();
+    }
+
+    fn get_block_height_cached(&mut self, bhh: &T) -> Result<Option<u32>, Error> {
+        if let Some(meta) = self.data.ephemeral_meta.as_ref() {
+            if &meta.block_hash == bhh {
+                return Ok(Some(meta.block_height));
+            }
+        }
+
+        let mut conn = self.connection();
+        conn.open_block(bhh)?;
+        MARF::get_block_height_miner_tip(&mut conn, bhh, bhh)
+    }
+
+    fn get_block_identifier_cached(&mut self, bhh: &T) -> Result<u32, Error> {
+        if let Some(meta) = self.data.ephemeral_meta.as_ref() {
+            if &meta.block_hash == bhh {
+                // for ephemeral tries, use u32::MAX as the block identifier
+                return Ok(u32::MAX);
+            }
+        }
+
+        self.get_block_id(bhh)
     }
 }
 
@@ -1698,6 +1770,9 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
 
                 readonly: true,
                 unconfirmed: self.unconfirmed(),
+
+                ephemeral: false,
+                ephemeral_meta: None,
             },
 
             // used in testing in order to short-circuit block-height lookups
@@ -1707,6 +1782,12 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
         };
 
         Ok(ret)
+    }
+
+    pub fn set_ephemeral_root_hash(&mut self, root: &TrieHash) {
+        if let Some(meta) = self.data.ephemeral_meta.as_mut() {
+            meta.root_hash = Some(root.clone());
+        }
     }
 
     /// Run `cls` with a mutable reference to the inner trie blobs opt.
@@ -1904,6 +1985,23 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
         Ok(())
     }
 
+    pub fn extend_to_block_ephemeral(&mut self, parent: &T, bhh: &T) -> Result<(), Error> {
+        self.clear_cached_ancestor_hashes_bytes();
+        if self.data.readonly {
+            return Err(Error::ReadOnlyError);
+        }
+        if self.has_block(bhh)? {
+            return Err(Error::ExistsError);
+        }
+        let size_hint = match self.data.uncommitted_writes {
+            Some((_, ref trie_storage)) => 2 * trie_storage.size_hint(),
+            None => 1024,
+        };
+        let trie_buf = TrieRAM::new(bhh, size_hint, parent);
+        self.switch_trie(bhh, UncommittedState::RW(trie_buf));
+        Ok(())
+    }
+
     /// Extend the forest of Tries to include a new unconfirmed block.
     /// If the unconfirmed block (bhh) already exists, then load up its trie as the uncommitted_writes
     /// trie.
@@ -1998,6 +2096,9 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
     }
 
     pub fn commit_tx(self) {
+        if self.is_ephemeral() {
+            return;
+        }
         match self.0.db {
             SqliteConnection::Tx(tx) => {
                 tx.commit().expect("CORRUPTION: Failed to commit MARF");
@@ -2021,6 +2122,26 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
                 );
             }
         }
+    }
+
+    pub fn set_ephemeral(&mut self, chain_tip: &T, child: &T, height: u32) {
+        self.data.ephemeral = true;
+        self.data.ephemeral_meta = Some(EphemeralBlockMeta {
+            block_hash: child.clone(),
+            parent_hash: chain_tip.clone(),
+            block_height: height,
+            root_hash: None,
+            block_id_hint: EPHEMERAL_BLOCK_ID,
+        });
+    }
+
+    pub fn is_ephemeral(&self) -> bool {
+        self.data.ephemeral
+    }
+
+    pub fn clear_ephemeral(&mut self) {
+        self.data.ephemeral = false;
+        self.data.ephemeral_meta = None;
     }
 }
 
@@ -2181,6 +2302,12 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
     /// Is the given block represented in either the confirmed or unconfirmed block tables?
     /// The mined table is ignored.
     pub fn has_block(&self, bhh: &T) -> Result<bool, Error> {
+        if let Some(meta) = self.data.ephemeral_meta.as_ref() {
+            if &meta.block_hash == bhh {
+                return Ok(true);
+            }
+        }
+
         Ok(self.has_confirmed_block(bhh)? || self.has_unconfirmed_block(bhh)?)
     }
 
@@ -2204,6 +2331,12 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
             &self.unconfirmed_block_id,
             self.unconfirmed()
         );
+        if let Some(meta) = self.data.ephemeral_meta.as_ref() {
+            if &meta.block_hash == bhh {
+                self.data.set_block(bhh.clone(), Some(meta.block_id_hint));
+                return Ok(());
+            }
+        }
         if *bhh == self.data.cur_block && self.data.cur_block_id.is_some() {
             // no-op
             return Ok(());
@@ -2230,6 +2363,14 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
             self.unconfirmed()
         );
         self.bench.open_block_start();
+
+        if let Some(meta) = self.data.ephemeral_meta.as_ref() {
+            if &meta.block_hash == bhh {
+                self.data.set_block(bhh.clone(), Some(meta.block_id_hint));
+                self.bench.open_block_finish(true);
+                return Ok(());
+            }
+        }
 
         if *bhh == self.data.cur_block && self.data.cur_block_id.is_some() {
             // no-op
@@ -2308,6 +2449,11 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
     ///  is currently being extended, return None, since the row_id won't
     ///  be known until the extended trie is flushed.
     pub fn get_block_identifier(&mut self, bhh: &T) -> Option<u32> {
+        if let Some(meta) = self.data.ephemeral_meta.as_ref() {
+            if &meta.block_hash == bhh {
+                return Some(meta.block_id_hint);
+            }
+        }
         if let Some((ref uncommitted_bhh, _)) = self.data.uncommitted_writes {
             if bhh == uncommitted_bhh {
                 return None;

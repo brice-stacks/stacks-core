@@ -375,6 +375,7 @@ impl NakamotoChainState {
         tenure_block_snapshot: &BlockSnapshot,
         coinbase_height: u64,
         tenure_cause: MinerTenureInfoCause,
+        ephemeral: bool,
     ) -> Result<SetupBlockResult<'a, 'b>, ChainstateError> {
         let burn_header_hash = &tenure_block_snapshot.burn_header_hash;
         let burn_header_height =
@@ -415,7 +416,7 @@ impl NakamotoChainState {
             coinbase_height,
             tenure_cause,
             None,
-            false,
+            ephemeral,
         )
     }
 }
@@ -469,6 +470,7 @@ impl NakamotoBlockBuilder {
             &tenure_snapshot,
             info.coinbase_height,
             info.cause,
+            info.ephemeral,
         )?;
         self.matured_miner_rewards_opt = matured_miner_rewards_opt;
         Ok(clarity_tx)
