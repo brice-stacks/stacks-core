@@ -275,30 +275,23 @@ impl StacksClient {
         debug!("StacksClient: Getting node epoch");
         let pox_info = self.get_pox_data()?;
         let burn_block_height = self.get_burn_block_height()?;
-
-        let epoch_25 = pox_info
-            .epochs
-            .iter()
-            .find(|epoch| epoch.epoch_id == StacksEpochId::Epoch25)
-            .ok_or(ClientError::UnsupportedStacksFeature(
+        let mut epochs: Vec<_> = pox_info.epochs.iter().collect();
+        if epochs.is_empty() {
+            return Err(ClientError::UnsupportedStacksFeature(
                 "/v2/pox must report epochs".into(),
-            ))?;
-
-        let epoch_30 = pox_info
-            .epochs
-            .iter()
-            .find(|epoch| epoch.epoch_id == StacksEpochId::Epoch30)
-            .ok_or(ClientError::UnsupportedStacksFeature(
-                "/v2/pox mut report epochs".into(),
-            ))?;
-
-        if burn_block_height < epoch_25.start_height {
-            Ok(StacksEpochId::Epoch24)
-        } else if burn_block_height < epoch_30.start_height {
-            Ok(StacksEpochId::Epoch25)
-        } else {
-            Ok(StacksEpochId::Epoch30)
+            ));
         }
+        epochs.sort_by_key(|epoch| epoch.start_height);
+
+        let mut current_epoch = StacksEpochId::Epoch10;
+        for epoch in epochs {
+            if burn_block_height < epoch.start_height {
+                return Ok(current_epoch);
+            }
+            current_epoch = epoch.epoch_id;
+        }
+
+        Ok(current_epoch)
     }
 
     /// Submit the block proposal to the stacks node. The block will be validated and returned via the HTTP endpoint for Block events.
@@ -766,6 +759,7 @@ mod tests {
     use blockstack_lib::chainstate::stacks::boot::{
         NakamotoSignerEntry, PoxStartCycleInfo, RewardSet,
     };
+    use blockstack_lib::net::api::getpoxinfo::RPCPoxEpoch;
     use clarity::types::chainstate::{StacksBlockId, TrieHash};
     use clarity::util::hash::Sha512Trunc256Sum;
     use clarity::util::secp256k1::MessageSignature;
@@ -998,7 +992,7 @@ mod tests {
     #[test]
     fn get_node_epoch_should_succeed() {
         let mock = MockServerClient::new();
-        // The burn block height is one BEHIND the activation height of 2.5, therefore is 2.4
+        // The burn block height is one BEFORE the activation height of the first listed epoch, therefore is 1.0
         let burn_block_height: u64 = 100;
         let pox_response = build_get_pox_data_response(
             None,
@@ -1013,7 +1007,7 @@ mod tests {
         let mock = MockServerClient::from_config(mock.config);
         write_response(mock.server, peer_response.as_bytes());
         let epoch = h.join().unwrap().expect("Failed to deserialize response");
-        assert_eq!(epoch, StacksEpochId::Epoch24);
+        assert_eq!(epoch, StacksEpochId::Epoch10);
 
         // The burn block height is the same as the activation height of 2.5, therefore is 2.5
         let pox_response = build_get_pox_data_response(None, None, Some(burn_block_height), None).0;
@@ -1077,6 +1071,90 @@ mod tests {
         write_response(mock.server, peer_response.as_bytes());
         let epoch = h.join().unwrap().expect("Failed to deserialize response");
         assert_eq!(epoch, StacksEpochId::Epoch30);
+
+        // The burn block height is after the activation height of 3.0 and additional epochs are reported.
+        let (_, mut extended_pox_data) = build_get_pox_data_response(
+            None,
+            None,
+            Some(burn_block_height.saturating_sub(1)),
+            Some(burn_block_height),
+        );
+        let block_limit_template = extended_pox_data
+            .epochs
+            .last()
+            .expect("PoX info must include at least one epoch")
+            .block_limit
+            .clone();
+        let epoch_31_start_height = burn_block_height.saturating_add(2);
+        let epoch_32_start_height = epoch_31_start_height.saturating_add(3);
+        let epoch_33_start_height = epoch_32_start_height.saturating_add(3);
+        extended_pox_data.epochs.extend([
+            RPCPoxEpoch {
+                epoch_id: StacksEpochId::Epoch31,
+                start_height: epoch_31_start_height,
+                end_height: epoch_32_start_height,
+                block_limit: block_limit_template.clone(),
+                network_epoch: 0,
+            },
+            RPCPoxEpoch {
+                epoch_id: StacksEpochId::Epoch32,
+                start_height: epoch_32_start_height,
+                end_height: epoch_33_start_height,
+                block_limit: block_limit_template.clone(),
+                network_epoch: 0,
+            },
+            RPCPoxEpoch {
+                epoch_id: StacksEpochId::Epoch33,
+                start_height: epoch_33_start_height,
+                end_height: epoch_33_start_height.saturating_add(1000),
+                block_limit: block_limit_template,
+                network_epoch: 0,
+            },
+        ]);
+        let extended_pox_response = format!(
+            "HTTP/1.1 200 OK\n\n{}",
+            serde_json::to_string(&extended_pox_data)
+                .expect("Failed to serialize extended PoX info")
+        );
+
+        // Heights at and between later epoch activation boundaries should map correctly.
+        let peer_response = build_get_peer_info_response(Some(epoch_31_start_height), None).0;
+        let mock = MockServerClient::from_config(mock.config);
+        let h = spawn(move || mock.client.get_node_epoch());
+        write_response(mock.server, extended_pox_response.as_bytes());
+        let mock = MockServerClient::from_config(mock.config);
+        write_response(mock.server, peer_response.as_bytes());
+        let epoch = h.join().unwrap().expect("Failed to deserialize response");
+        assert_eq!(epoch, StacksEpochId::Epoch31);
+
+        let peer_response =
+            build_get_peer_info_response(Some(epoch_32_start_height.saturating_sub(1)), None).0;
+        let mock = MockServerClient::from_config(mock.config);
+        let h = spawn(move || mock.client.get_node_epoch());
+        write_response(mock.server, extended_pox_response.as_bytes());
+        let mock = MockServerClient::from_config(mock.config);
+        write_response(mock.server, peer_response.as_bytes());
+        let epoch = h.join().unwrap().expect("Failed to deserialize response");
+        assert_eq!(epoch, StacksEpochId::Epoch31);
+
+        let peer_response = build_get_peer_info_response(Some(epoch_32_start_height), None).0;
+        let mock = MockServerClient::from_config(mock.config);
+        let h = spawn(move || mock.client.get_node_epoch());
+        write_response(mock.server, extended_pox_response.as_bytes());
+        let mock = MockServerClient::from_config(mock.config);
+        write_response(mock.server, peer_response.as_bytes());
+        let epoch = h.join().unwrap().expect("Failed to deserialize response");
+        assert_eq!(epoch, StacksEpochId::Epoch32);
+
+        let peer_response =
+            build_get_peer_info_response(Some(epoch_33_start_height.saturating_add(1)), None).0;
+        let mock = MockServerClient::from_config(mock.config);
+        let h = spawn(move || mock.client.get_node_epoch());
+        write_response(mock.server, extended_pox_response.as_bytes());
+        let mock = MockServerClient::from_config(mock.config);
+        write_response(mock.server, peer_response.as_bytes());
+        let epoch = h.join().unwrap().expect("Failed to deserialize response");
+        assert_eq!(epoch, StacksEpochId::Epoch33);
     }
 
     #[test]
