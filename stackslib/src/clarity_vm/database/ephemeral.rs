@@ -27,6 +27,7 @@ use rusqlite;
 use rusqlite::Connection;
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId, TrieHash};
+use stacks_common::types::sqlite::NO_PARAMS;
 
 use crate::chainstate::stacks::index::marf::{MarfConnection, MarfTransaction};
 use crate::chainstate::stacks::index::{Error, MARFValue};
@@ -55,6 +56,8 @@ pub struct EphemeralMarfStore<'a> {
     ephemeral_marf: MarfTransaction<'a, StacksBlockId>,
     /// Handle to on-disk MARF
     read_only_marf: ReadOnlyMarfStore,
+    /// Whether the unified data/metadata views are currently installed
+    views_installed: bool,
 }
 
 impl ClarityMarfStore for EphemeralMarfStore<'_> {}
@@ -68,9 +71,11 @@ impl ClarityMarfStoreTransaction for EphemeralMarfStore<'_> {
     /// Returns Ok(()) on success
     /// Returns Err(InterpreterError(..)) on sqlite failure
     fn commit_metadata_for_trie(&mut self, target: &StacksBlockId) -> InterpreterResult<()> {
-        if let Some(tip) = self.ephemeral_marf.get_open_chain_tip() {
+        if let Some(tip) = self.ephemeral_marf.get_open_chain_tip().cloned() {
+            self.teardown_views();
             let res =
-                SqliteConnection::commit_metadata_to(self.ephemeral_marf.sqlite_tx(), tip, target);
+                SqliteConnection::commit_metadata_to(self.ephemeral_marf.sqlite_tx(), &tip, target);
+            self.setup_views();
             res
         } else {
             Ok(())
@@ -84,7 +89,10 @@ impl ClarityMarfStoreTransaction for EphemeralMarfStore<'_> {
     /// Returns Ok(()) on success
     /// Returns Err(InterpreterError(..)) on sqlite failure
     fn drop_metadata_for_trie(&mut self, target: &StacksBlockId) -> InterpreterResult<()> {
-        SqliteConnection::drop_metadata(self.ephemeral_marf.sqlite_tx(), target)
+        self.teardown_views();
+        let res = SqliteConnection::drop_metadata(self.ephemeral_marf.sqlite_tx(), target);
+        self.setup_views();
+        res
     }
 
     /// Seal the trie -- compute the root hash.
@@ -201,20 +209,94 @@ impl<'a> EphemeralMarfStore<'a> {
         mut read_only_marf: ReadOnlyMarfStore,
         ephemeral_marf_tx: MarfTransaction<'a, StacksBlockId>,
     ) -> Result<Self, Error> {
+        let read_only_db = read_only_marf.get_db_path().to_string();
+        Self::attach_read_only_marf(ephemeral_marf_tx.sqlite_conn(), &read_only_db)?;
+
         let base_tip_height = read_only_marf.get_current_block_height();
         let ephemeral_tip = ephemeral_marf_tx
             .get_open_chain_tip()
             .ok_or(Error::NotFoundError)?
             .clone();
-        let ephemeral_marf_store = Self {
+        let mut ephemeral_marf_store = Self {
             open_tip: EphemeralTip::RAM(ephemeral_tip),
             base_tip: read_only_marf.get_chain_tip().clone(),
             base_tip_height,
             ephemeral_marf: ephemeral_marf_tx,
             read_only_marf,
+            views_installed: false,
         };
 
+        ephemeral_marf_store.setup_views();
         Ok(ephemeral_marf_store)
+    }
+
+    fn attach_read_only_marf(conn: &Connection, read_only_path: &str) -> Result<(), Error> {
+        conn.execute(
+            "ATTACH DATABASE ?1 AS read_only_marf",
+            rusqlite::params![read_only_path],
+        )?;
+        Ok(())
+    }
+
+    fn setup_views(&mut self) {
+        if self.views_installed {
+            return;
+        }
+        let conn = self.ephemeral_marf.sqlite_conn();
+        conn.execute(
+            "ALTER TABLE data_table RENAME TO ephemeral_data_table",
+            NO_PARAMS,
+        )
+        .expect("FATAL: failed to rename data_table to ephemeral_data_table");
+        conn.execute(
+            "ALTER TABLE metadata_table RENAME TO ephemeral_metadata_table",
+            NO_PARAMS,
+        )
+        .expect("FATAL: failed to rename metadata_table to ephemeral_metadata_table");
+        conn.execute(
+            "CREATE TEMP VIEW data_table(key, value) AS \
+             SELECT key, value FROM ephemeral_data_table \
+             UNION ALL \
+             SELECT ro.key, ro.value FROM read_only_marf.data_table AS ro \
+             WHERE NOT EXISTS (SELECT 1 FROM ephemeral_data_table AS em WHERE em.key = ro.key)",
+            NO_PARAMS,
+        )
+        .expect("FATAL: failed to setup temp view data_table on ephemeral MARF DB");
+        conn.execute(
+            "CREATE TEMP VIEW metadata_table(key, blockhash, value) AS \
+             SELECT key, blockhash, value FROM ephemeral_metadata_table \
+             UNION ALL \
+             SELECT ro.key, ro.blockhash, ro.value FROM read_only_marf.metadata_table AS ro \
+             WHERE NOT EXISTS (\
+                 SELECT 1 FROM ephemeral_metadata_table AS em \
+                 WHERE em.key = ro.key AND em.blockhash = ro.blockhash\
+             )",
+            NO_PARAMS,
+        )
+        .expect("FATAL: failed to setup temp view metadata_table on ephemeral MARF DB");
+        self.views_installed = true;
+    }
+
+    fn teardown_views(&mut self) {
+        if !self.views_installed {
+            return;
+        }
+        let conn = self.ephemeral_marf.sqlite_conn();
+        conn.execute("DROP VIEW data_table", NO_PARAMS)
+            .expect("FATAL: failed to drop data_table view");
+        conn.execute("DROP VIEW metadata_table", NO_PARAMS)
+            .expect("FATAL: failed to drop metadata_table view");
+        conn.execute(
+            "ALTER TABLE ephemeral_data_table RENAME TO data_table",
+            NO_PARAMS,
+        )
+        .expect("FATAL: failed to restore data_table");
+        conn.execute(
+            "ALTER TABLE ephemeral_metadata_table RENAME TO metadata_table",
+            NO_PARAMS,
+        )
+        .expect("FATAL: failed to restore metadata_table");
+        self.views_installed = false;
     }
 
     /// Test to see if a given tip is in the ephemeral MARF
@@ -599,10 +681,40 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
     /// Returns Ok(()) on success
     /// Returns Err(..) on inner MARF errors.
     fn put_all_data(&mut self, items: Vec<(String, String)>) -> InterpreterResult<()> {
-        let mut keys = Vec::with_capacity(items.len());
-        let mut values = Vec::with_capacity(items.len());
-
+        let mut staged = Vec::with_capacity(items.len());
         for (key, value) in items.into_iter() {
+            let prior_value = match self.get_data(&key) {
+                Ok(val) => val,
+                Err(e) => {
+                    debug!(
+                        "Ephemeral MARF: failed to load prior value for key {}: {:?}",
+                        key, e
+                    );
+                    None
+                }
+            };
+            staged.push((key, value, prior_value));
+        }
+
+        self.teardown_views();
+
+        let mut keys = Vec::with_capacity(staged.len());
+        let mut values = Vec::with_capacity(staged.len());
+        for (key, value, prior_value) in staged.into_iter() {
+            let status = match &prior_value {
+                Some(old) if old == &value => "unchanged",
+                Some(_) => "updated",
+                None => "new",
+            };
+            debug!(
+                "Ephemeral MARF put_all_data tip={:?} key={} prev_len={} new_len={} status={}",
+                self.open_tip,
+                key,
+                prior_value.as_ref().map(|v| v.len()).unwrap_or(0),
+                value.len(),
+                status
+            );
+
             let marf_value = MARFValue::from_value(&value);
             SqliteConnection::put(
                 self.ephemeral_marf.sqlite_tx(),
@@ -619,6 +731,7 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
             keys.push(key);
             values.push(marf_value);
         }
+
         self.ephemeral_marf
             .insert_batch(&keys, values)
             .unwrap_or_else(|e| {
@@ -627,6 +740,7 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
                     e
                 )
             });
+        self.setup_views();
         Ok(())
     }
 
@@ -653,7 +767,10 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
         key: &str,
         value: &str,
     ) -> InterpreterResult<()> {
-        sqlite_insert_metadata(self, contract, key, value)
+        self.teardown_views();
+        let res = sqlite_insert_metadata(self, contract, key, value);
+        self.setup_views();
+        res
     }
 
     /// Load up metadata from the metadata table (materialized view) in the ephemeral MARF
