@@ -1553,11 +1553,15 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
 
     #[cfg(test)]
     pub fn new_memory(marf_opts: MARFOpenOpts) -> Result<TrieFileStorage<T>, Error> {
-        TrieFileStorage::open(":memory:", marf_opts)
+        TrieFileStorage::open(":memory:", marf_opts, false)
     }
 
-    pub fn open(db_path: &str, marf_opts: MARFOpenOpts) -> Result<TrieFileStorage<T>, Error> {
-        TrieFileStorage::open_opts(db_path, false, false, marf_opts)
+    pub fn open(
+        db_path: &str,
+        marf_opts: MARFOpenOpts,
+        readonly: bool,
+    ) -> Result<TrieFileStorage<T>, Error> {
+        TrieFileStorage::open_opts(db_path, readonly, false, marf_opts)
     }
 
     pub fn open_readonly(

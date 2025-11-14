@@ -2310,7 +2310,7 @@ mod tests {
         let mut marf_opts = MARFOpenOpts::default();
         marf_opts.external_blobs = true;
 
-        let mut marf: MARF<StacksBlockId> = MARF::from_path(&marf_path, marf_opts).unwrap();
+        let mut marf: MARF<StacksBlockId> = MARF::from_path(&marf_path, marf_opts, false).unwrap();
 
         let tx = marf.storage_tx().unwrap();
 

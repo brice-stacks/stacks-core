@@ -2647,10 +2647,11 @@ impl SortitionDB {
         self.marf.sqlite_conn()
     }
 
-    fn open_index(index_path: &str) -> Result<MARF<SortitionId>, db_error> {
+    fn open_index(index_path: &str, readwrite: bool) -> Result<MARF<SortitionId>, db_error> {
         test_debug!("Open index at {}", index_path);
         let open_opts = MARFOpenOpts::default();
-        let marf = MARF::from_path(index_path, open_opts).map_err(|_e| db_error::Corruption)?;
+        let marf = MARF::from_path(index_path, open_opts, !readwrite)
+            .map_err(|_e| db_error::Corruption)?;
         sql_pragma(marf.sqlite_conn(), "foreign_keys", &true)?;
         Ok(marf)
     }
@@ -2670,7 +2671,7 @@ impl SortitionDB {
             index_path
         );
 
-        let marf = SortitionDB::open_index(&index_path)?;
+        let marf = SortitionDB::open_index(&index_path, readwrite)?;
         let (first_block_height, first_burn_header_hash) =
             SortitionDB::get_first_block_height_and_hash(marf.sqlite_conn())?;
 
@@ -2730,7 +2731,7 @@ impl SortitionDB {
             index_path
         );
 
-        let marf = SortitionDB::open_index(&index_path)?;
+        let marf = SortitionDB::open_index(&index_path, readwrite)?;
 
         let mut db = SortitionDB {
             path: path.to_string(),
@@ -3045,7 +3046,7 @@ impl SortitionDB {
             return Err(db_error::NoDBError);
         }
         let index_path = db_mkdirs(path)?;
-        let marf = SortitionDB::open_index(&index_path)?;
+        let marf = SortitionDB::open_index(&index_path, false)?;
         SortitionDB::get_schema_version(marf.sqlite_conn())
     }
 
@@ -3057,7 +3058,7 @@ impl SortitionDB {
             return Err(db_error::NoDBError);
         }
         let index_path = db_mkdirs(path)?;
-        let marf = SortitionDB::open_index(&index_path)?;
+        let marf = SortitionDB::open_index(&index_path, false)?;
         let sql = "SELECT MAX(block_height) FROM snapshots";
         Ok(query_rows(marf.sqlite_conn(), sql, NO_PARAMS)?
             .pop()
@@ -3432,7 +3433,7 @@ impl SortitionDB {
             SortitionDB::open(path, false, PoxConstants::mainnet_default())
         {
             let index_path = db_mkdirs(path)?;
-            let marf = SortitionDB::open_index(&index_path)?;
+            let marf = SortitionDB::open_index(&index_path, true)?;
             let mut db = SortitionDB {
                 path: path.to_string(),
                 marf,
@@ -6729,7 +6730,7 @@ pub mod tests {
                 if readwrite { "readwrite" } else { "readonly" }
             );
 
-            let marf = SortitionDB::open_index(&index_path)?;
+            let marf = SortitionDB::open_index(&index_path, readwrite)?;
 
             let mut db = SortitionDB {
                 path: path.to_string(),

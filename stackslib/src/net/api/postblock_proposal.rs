@@ -740,7 +740,7 @@ impl NakamotoBlockProposal {
             u64::from(DEFAULT_MAX_TENURE_BYTES),
         )?;
         let (mut replay_chainstate, _) =
-            StacksChainState::open(mainnet, chain_id, chainstate_path, None)?;
+            StacksChainState::open(mainnet, chain_id, chainstate_path, None, true)?;
         let mut replay_miner_tenure_info =
             replay_builder.load_tenure_info(&mut replay_chainstate, &burn_dbconn, tenure_cause)?;
         let mut replay_tenure_tx =

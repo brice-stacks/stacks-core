@@ -3122,6 +3122,7 @@ mod test {
             &chainstate_path,
             Some(&mut boot_data),
             None,
+            false,
         )
         .unwrap();
 

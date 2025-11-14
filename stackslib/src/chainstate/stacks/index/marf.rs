@@ -1154,8 +1154,12 @@ impl<T: MarfTrieId> MARF<T> {
     /// Instantiate the MARF using a TrieFileStorage instance, from the given path on disk.
     /// This will have the side-effect of instantiating a new fork table from the tries encoded on
     /// disk. Performant code should call this method sparingly.
-    pub fn from_path(path: &str, open_opts: MARFOpenOpts) -> Result<MARF<T>, Error> {
-        let file_storage = TrieFileStorage::open(path, open_opts)?;
+    pub fn from_path(
+        path: &str,
+        open_opts: MARFOpenOpts,
+        readonly: bool,
+    ) -> Result<MARF<T>, Error> {
+        let file_storage = TrieFileStorage::open(path, open_opts, readonly)?;
         Ok(MARF::from_storage(file_storage))
     }
 

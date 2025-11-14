@@ -375,6 +375,7 @@ pub fn setup_states_with_epochs(
             &format!("{}/chainstate/", path),
             Some(&mut boot_data),
             None,
+            false,
         )
         .unwrap();
     }
@@ -562,8 +563,14 @@ pub fn get_chainstate_path_str(path: &str) -> String {
 }
 
 pub fn get_chainstate(path: &str) -> StacksChainState {
-    let (chainstate, _) =
-        StacksChainState::open(false, 0x80000000, &get_chainstate_path_str(path), None).unwrap();
+    let (chainstate, _) = StacksChainState::open(
+        false,
+        0x80000000,
+        &get_chainstate_path_str(path),
+        None,
+        false,
+    )
+    .unwrap();
     chainstate
 }
 

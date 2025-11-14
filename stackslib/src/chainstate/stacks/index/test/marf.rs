@@ -1273,7 +1273,7 @@ fn marf_insert_random_10485760_4096_file_storage() {
         fs::remove_dir_all(&path).unwrap();
     };
     let marf_opts = MARFOpenOpts::default();
-    let f = TrieFileStorage::open(&path, marf_opts).unwrap();
+    let f = TrieFileStorage::open(&path, marf_opts, false).unwrap();
     let mut m = MARF::from_storage(f);
 
     let mut block_header = BlockHeaderHash::sentinel();
@@ -1694,7 +1694,7 @@ fn marf_insert_get_128_fork_256() {
     let path = ":memory:".to_string();
 
     let marf_opts = MARFOpenOpts::default();
-    let mut m = MARF::from_path(&path, marf_opts).unwrap();
+    let mut m = MARF::from_path(&path, marf_opts, false).unwrap();
     let mut fork_headers = vec![];
 
     let mut pattern = 0u8;
@@ -2160,7 +2160,7 @@ fn test_marf_unconfirmed() {
     // set up a confirmed MARF
     {
         let marf_opts = MARFOpenOpts::default();
-        let cf = TrieFileStorage::<StacksBlockId>::open(marf_path, marf_opts).unwrap();
+        let cf = TrieFileStorage::<StacksBlockId>::open(marf_path, marf_opts, false).unwrap();
         let mut confirmed_marf = MARF::<StacksBlockId>::from_storage(cf);
         confirmed_marf
             .begin(&StacksBlockId::sentinel(), &StacksBlockId([0x11; 32]))

@@ -83,7 +83,7 @@ impl MarfedKV {
             MARF::from_path_unconfirmed(&marf_path, marf_opts)
                 .map_err(|err| VmInternalError::MarfFailure(err.to_string()))?
         } else {
-            MARF::from_path(&marf_path, marf_opts)
+            MARF::from_path(&marf_path, marf_opts, false)
                 .map_err(|err| VmInternalError::MarfFailure(err.to_string()))?
         };
 
@@ -301,6 +301,7 @@ impl MarfedKV {
         let ephemeral_marf_storage = TrieFileStorage::open(
             ":memory:",
             MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", false),
+            false,
         )
         .map_err(|e| {
             VmInternalError::Expect(format!("Failed to instantiate ephemeral MARF: {:?}", &e))

@@ -4309,7 +4309,8 @@ pub mod test {
                 1000,
                 |mut builder, ref mut miner, sortdb| {
                     let (mut miner_chainstate, _) =
-                        StacksChainState::open(false, network_id, &chainstate_path, None).unwrap();
+                        StacksChainState::open(false, network_id, &chainstate_path, None, false)
+                            .unwrap();
                     let sort_iconn = sortdb.index_handle_at_tip();
 
                     let mut miner_epoch_info = builder

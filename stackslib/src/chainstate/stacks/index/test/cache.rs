@@ -77,7 +77,7 @@ fn test_marf_with_cache(
     };
 
     let marf_opts = MARFOpenOpts::new(hash_strategy, cache_strategy, true);
-    let f = TrieFileStorage::open(&test_file, marf_opts).unwrap();
+    let f = TrieFileStorage::open(&test_file, marf_opts, false).unwrap();
     let mut marf = MARF::from_storage(f);
     let mut last_block_header = BlockHeaderHash::sentinel();
     let batch_size = batch_size.unwrap_or(0);

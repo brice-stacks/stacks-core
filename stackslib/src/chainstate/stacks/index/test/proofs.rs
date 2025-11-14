@@ -23,7 +23,7 @@ fn verifier_catches_stale_proof() {
     env::set_var("BLOCKSTACK_TEST_PROOF_ALLOW_INVALID", "1");
 
     let marf_opts = MARFOpenOpts::default();
-    let mut m = MARF::from_path(":memory:", marf_opts).unwrap();
+    let mut m = MARF::from_path(":memory:", marf_opts, false).unwrap();
 
     let sentinel_block = BlockHeaderHash::sentinel();
     let block_0 = BlockHeaderHash([0u8; 32]);
@@ -92,7 +92,7 @@ fn verifier_catches_stale_proof() {
 #[test]
 fn ncc_verifier_catches_stale_proof() {
     let marf_opts = MARFOpenOpts::default();
-    let mut m = MARF::from_path(":memory:", marf_opts).unwrap();
+    let mut m = MARF::from_path(":memory:", marf_opts, false).unwrap();
 
     let sentinel_block = BlockHeaderHash::sentinel();
     let block_0 = BlockHeaderHash([0u8; 32]);

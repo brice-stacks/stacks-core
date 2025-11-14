@@ -1002,7 +1002,7 @@ impl StacksChainState {
         marf_path: &str,
         migrate: bool,
     ) -> Result<MARF<StacksBlockId>, Error> {
-        let mut marf = StacksChainState::open_index(marf_path)?;
+        let mut marf = StacksChainState::open_index(marf_path, false)?;
         let mut dbtx = StacksDBTx::new(&mut marf, ());
 
         {
@@ -1037,7 +1037,7 @@ impl StacksChainState {
             .ok_or_else(|| db_error::ParseError)?
             .to_string();
 
-        let marf = StacksChainState::open_index(&index_path)?;
+        let marf = StacksChainState::open_index(&index_path, false)?;
         StacksChainState::load_db_config(marf.sqlite_conn())
     }
 
@@ -1200,15 +1200,16 @@ impl StacksChainState {
         mainnet: bool,
         chain_id: u32,
         index_path: &str,
+        readonly: bool,
     ) -> Result<MARF<StacksBlockId>, Error> {
-        let create_flag = fs::metadata(index_path).is_err();
+        let create_flag = !readonly && fs::metadata(index_path).is_err();
 
         if create_flag {
             // instantiate!
             StacksChainState::instantiate_db(mainnet, chain_id, index_path, true)
         } else {
-            let mut marf = StacksChainState::open_index(index_path)?;
-            if !Self::need_schema_migrations(marf.sqlite_conn(), mainnet, chain_id)? {
+            let mut marf = StacksChainState::open_index(index_path, readonly)?;
+            if readonly || !Self::need_schema_migrations(marf.sqlite_conn(), mainnet, chain_id)? {
                 return Ok(marf);
             }
 
@@ -1233,7 +1234,7 @@ impl StacksChainState {
             // instantiate!
             StacksChainState::instantiate_db(mainnet, chain_id, index_path, false)
         } else {
-            let mut marf = StacksChainState::open_index(index_path)?;
+            let mut marf = StacksChainState::open_index(index_path, false)?;
 
             // do we need to apply a schema change?
             let db_config = StacksChainState::load_db_config(marf.sqlite_conn())
@@ -1246,11 +1247,11 @@ impl StacksChainState {
         }
     }
 
-    pub fn open_index(marf_path: &str) -> Result<MARF<StacksBlockId>, db_error> {
+    pub fn open_index(marf_path: &str, readonly: bool) -> Result<MARF<StacksBlockId>, db_error> {
         test_debug!("Open MARF index at {}", marf_path);
         let mut open_opts = MARFOpenOpts::default();
         open_opts.external_blobs = true;
-        let marf = MARF::from_path(marf_path, open_opts).map_err(db_error::IndexError)?;
+        let marf = MARF::from_path(marf_path, open_opts, readonly).map_err(db_error::IndexError)?;
         Ok(marf)
     }
 
@@ -1781,8 +1782,9 @@ impl StacksChainState {
         chain_id: u32,
         path_str: &str,
         marf_opts: Option<MARFOpenOpts>,
+        readonly: bool,
     ) -> Result<(StacksChainState, Vec<StacksTransactionReceipt>), Error> {
-        StacksChainState::open_and_exec(mainnet, chain_id, path_str, None, marf_opts)
+        StacksChainState::open_and_exec(mainnet, chain_id, path_str, None, marf_opts, readonly)
     }
 
     /// Re-open the chainstate -- i.e. to get a new handle to it using an existing chain state's
@@ -1793,6 +1795,7 @@ impl StacksChainState {
             self.chain_id,
             &self.root_path,
             self.marf_opts.clone(),
+            false,
         )
     }
 
@@ -1806,7 +1809,7 @@ impl StacksChainState {
             .to_string();
 
         let state_index =
-            StacksChainState::open_db(self.mainnet, self.chain_id, &header_index_root)?;
+            StacksChainState::open_db(self.mainnet, self.chain_id, &header_index_root, false)?;
         Ok(state_index.into_sqlite_conn())
     }
 
@@ -1856,6 +1859,7 @@ impl StacksChainState {
         path_str: &str,
         boot_data: Option<&mut ChainStateBootData>,
         marf_opts: Option<MARFOpenOpts>,
+        readonly: bool,
     ) -> Result<(StacksChainState, Vec<StacksTransactionReceipt>), Error> {
         StacksChainState::make_chainstate_dirs(path_str)?;
         let path = PathBuf::from(path_str);
@@ -1887,12 +1891,15 @@ impl StacksChainState {
 
         let nakamoto_staging_blocks_path =
             StacksChainState::static_get_nakamoto_staging_blocks_path(path)?;
-        let nakamoto_staging_blocks_conn =
-            StacksChainState::open_nakamoto_staging_blocks(&nakamoto_staging_blocks_path, true)?;
+        let nakamoto_staging_blocks_conn = StacksChainState::open_nakamoto_staging_blocks(
+            &nakamoto_staging_blocks_path,
+            !readonly,
+        )?;
 
         let init_required = fs::metadata(&clarity_state_index_marf).is_err();
 
-        let state_index = StacksChainState::open_db(mainnet, chain_id, &header_index_root)?;
+        let state_index =
+            StacksChainState::open_db(mainnet, chain_id, &header_index_root, readonly)?;
 
         let vm_state = MarfedKV::open(
             &clarity_state_index_root,
@@ -2915,14 +2922,14 @@ pub mod test {
             get_bulk_initial_namespaces: None,
         };
 
-        StacksChainState::open_and_exec(mainnet, chain_id, &path, Some(&mut boot_data), None)
+        StacksChainState::open_and_exec(mainnet, chain_id, &path, Some(&mut boot_data), None, false)
             .unwrap()
             .0
     }
 
     pub fn open_chainstate(mainnet: bool, chain_id: u32, test_name: &str) -> StacksChainState {
         let path = chainstate_path(test_name);
-        StacksChainState::open(mainnet, chain_id, &path, None)
+        StacksChainState::open(mainnet, chain_id, &path, None, false)
             .unwrap()
             .0
     }
@@ -3014,10 +3021,16 @@ pub mod test {
             fs::remove_dir_all(&path).unwrap();
         };
 
-        let mut chainstate =
-            StacksChainState::open_and_exec(false, 0x80000000, &path, Some(&mut boot_data), None)
-                .unwrap()
-                .0;
+        let mut chainstate = StacksChainState::open_and_exec(
+            false,
+            0x80000000,
+            &path,
+            Some(&mut boot_data),
+            None,
+            false,
+        )
+        .unwrap()
+        .0;
 
         let genesis_root_hash = chainstate.clarity_state.with_marf(|marf| {
             let index_block_hash = StacksBlockHeader::make_index_block_hash(
@@ -3101,10 +3114,16 @@ pub mod test {
             fs::remove_dir_all(&path).unwrap();
         };
 
-        let mut chainstate =
-            StacksChainState::open_and_exec(true, 0x000000001, &path, Some(&mut boot_data), None)
-                .unwrap()
-                .0;
+        let mut chainstate = StacksChainState::open_and_exec(
+            true,
+            0x000000001,
+            &path,
+            Some(&mut boot_data),
+            None,
+            false,
+        )
+        .unwrap()
+        .0;
 
         let genesis_root_hash = chainstate.clarity_state.with_marf(|marf| {
             let index_block_hash = StacksBlockHeader::make_index_block_hash(

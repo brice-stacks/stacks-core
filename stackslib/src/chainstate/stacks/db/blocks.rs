@@ -10193,9 +10193,10 @@ pub mod test {
             .burnchain
             .block_height_to_reward_cycle(last_stacks_block_height)
             .unwrap();
-        let mut chainstate = StacksChainState::open(false, 0x80000000, &chainstate_path, None)
-            .unwrap()
-            .0;
+        let mut chainstate =
+            StacksChainState::open(false, 0x80000000, &chainstate_path, None, false)
+                .unwrap()
+                .0;
 
         test_debug!(
             "first, last block heights are {}, {}. Total reward cycles: {}",

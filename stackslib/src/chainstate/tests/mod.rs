@@ -316,6 +316,7 @@ impl<'a> TestChainstate<'a> {
             &chainstate_path,
             Some(&mut boot_data),
             None,
+            true,
         )
         .unwrap();
 

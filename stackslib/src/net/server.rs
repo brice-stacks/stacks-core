@@ -707,7 +707,7 @@ mod test {
         let mut client_threads = vec![];
         let mut client_handles = vec![];
         let (mut chainstate, _) =
-            StacksChainState::open(false, network_id, &chainstate_path, None).unwrap();
+            StacksChainState::open(false, network_id, &chainstate_path, None, true).unwrap();
         for i in 0..num_clients {
             let request = make_request(i, &mut chainstate);
             client_requests.push(request);

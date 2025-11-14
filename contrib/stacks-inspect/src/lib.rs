@@ -226,6 +226,7 @@ pub fn command_validate_block_nakamoto(argv: &[String], conf: Option<&Config>) {
         conf.burnchain.chain_id,
         &chain_state_path,
         None,
+        true,
     )
     .unwrap();
 
@@ -432,6 +433,7 @@ pub fn command_try_mine(argv: &[String], conf: Option<&Config>) {
         conf.burnchain.chain_id,
         &chain_state_path,
         None,
+        true,
     )
     .unwrap_or_else(|e| panic!("Failed to open stacks chain state: {e}"));
     let chain_tip = SortitionDB::get_canonical_burn_chain_tip(sort_db.conn())
@@ -595,6 +597,7 @@ fn replay_staging_block(db_path: &str, index_block_hash_hex: &str, conf: Option<
         conf.burnchain.chain_id,
         &chain_state_path,
         None,
+        true,
     )
     .unwrap();
 
@@ -670,6 +673,7 @@ fn replay_mock_mined_block(db_path: &str, block: AssembledAnchorBlock, conf: Opt
         conf.burnchain.chain_id,
         &chain_state_path,
         None,
+        true,
     )
     .unwrap();
 
@@ -876,6 +880,7 @@ fn replay_naka_staging_block(db_path: &str, index_block_hash_hex: &str, conf: &C
         conf.burnchain.chain_id,
         &chain_state_path,
         None,
+        true,
     )
     .unwrap();
 

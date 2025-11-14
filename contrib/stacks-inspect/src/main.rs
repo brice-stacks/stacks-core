@@ -284,7 +284,7 @@ fn open_nakamoto_chainstate_dbs(
     let sort_db = SortitionDB::open(&sort_db_path, true, pox_constants)
         .unwrap_or_else(|_| panic!("Failed to open {sort_db_path}"));
 
-    let (chain_state, _) = StacksChainState::open(mainnet, chain_id, &chain_state_path, None)
+    let (chain_state, _) = StacksChainState::open(mainnet, chain_id, &chain_state_path, None, true)
         .expect("Failed to open stacks chain state");
 
     (sort_db, chain_state)
@@ -509,7 +509,7 @@ fn main() {
         let chain_state_path = format!("{}/mainnet/chainstate/", &argv[2]);
 
         let (chainstate, _) =
-            StacksChainState::open(true, CHAIN_ID_MAINNET, &chain_state_path, None).unwrap();
+            StacksChainState::open(true, CHAIN_ID_MAINNET, &chain_state_path, None, true).unwrap();
 
         let (consensus_hash, block_hash) = chainstate
             .get_block_header_hashes(&index_block_hash)
@@ -598,8 +598,9 @@ Given a <working-dir>, obtain a 2100 header hash block inventory (with an empty 
         let sort_db = SortitionDB::open(&sort_db_path, false, PoxConstants::mainnet_default())
             .unwrap_or_else(|_| panic!("Failed to open {sort_db_path}"));
         let chain_id = CHAIN_ID_MAINNET;
-        let (chain_state, _) = StacksChainState::open(true, chain_id, &chain_state_path, None)
-            .expect("Failed to open stacks chain state");
+        let (chain_state, _) =
+            StacksChainState::open(true, chain_id, &chain_state_path, None, true)
+                .expect("Failed to open stacks chain state");
         let chain_tip = SortitionDB::get_canonical_burn_chain_tip(sort_db.conn())
             .expect("Failed to get sortition chain tip");
 
@@ -642,8 +643,9 @@ check if the associated microblocks can be downloaded
         let sort_db = SortitionDB::open(&sort_db_path, false, PoxConstants::mainnet_default())
             .unwrap_or_else(|_| panic!("Failed to open {sort_db_path}"));
         let chain_id = CHAIN_ID_MAINNET;
-        let (chain_state, _) = StacksChainState::open(true, chain_id, &chain_state_path, None)
-            .expect("Failed to open stacks chain state");
+        let (chain_state, _) =
+            StacksChainState::open(true, chain_id, &chain_state_path, None, true)
+                .expect("Failed to open stacks chain state");
         let chain_tip = SortitionDB::get_canonical_burn_chain_tip(sort_db.conn())
             .expect("Failed to get sortition chain tip");
 
@@ -868,7 +870,7 @@ check if the associated microblocks can be downloaded
 
         let marf_bhh = StacksBlockId::from_hex(marf_tip).expect("Bad MARF block hash");
         let marf_opts = MARFOpenOpts::default();
-        let mut marf = MARF::from_path(&marf_path, marf_opts).expect("Failed to open MARF");
+        let mut marf = MARF::from_path(&marf_path, marf_opts, true).expect("Failed to open MARF");
         let value_opt = marf.get(&marf_bhh, marf_key).expect("Failed to read MARF");
 
         if let Some(value) = value_opt {
@@ -921,7 +923,7 @@ check if the associated microblocks can be downloaded
 
         let mut marf_opts = MARFOpenOpts::default();
         marf_opts.external_blobs = true;
-        let mut marf = MARF::from_path(path, marf_opts).unwrap();
+        let mut marf = MARF::from_path(path, marf_opts, true).unwrap();
         let res = marf.get(&itip, key).expect("MARF error.");
         match res {
             Some(x) => println!("{x}"),
@@ -1308,7 +1310,7 @@ check if the associated microblocks can be downloaded
         let burnchain_db_path = &argv[6];
 
         let (old_chainstate, _) =
-            StacksChainState::open(false, 0x80000000, old_chainstate_path, None).unwrap();
+            StacksChainState::open(false, 0x80000000, old_chainstate_path, None, true).unwrap();
         let old_sortition_db =
             SortitionDB::open(old_sort_path, true, PoxConstants::mainnet_default()).unwrap();
 
@@ -1374,6 +1376,7 @@ check if the associated microblocks can be downloaded
             new_chainstate_path,
             Some(&mut boot_data),
             None,
+            true,
         )
         .unwrap();
 
@@ -1437,7 +1440,7 @@ check if the associated microblocks can be downloaded
             )
             .unwrap();
         let (mut p2p_chainstate, _) =
-            StacksChainState::open(false, 0x80000000, new_chainstate_path, None).unwrap();
+            StacksChainState::open(false, 0x80000000, new_chainstate_path, None, true).unwrap();
 
         let _ = thread::spawn(move || {
             loop {
@@ -1664,7 +1667,7 @@ simulating a miner.
     let sort_db = SortitionDB::open(&sort_db_path, false, PoxConstants::mainnet_default())
         .unwrap_or_else(|_| panic!("Failed to open {sort_db_path}"));
     let chain_id = CHAIN_ID_MAINNET;
-    let mut chain_state = StacksChainState::open(true, chain_id, &chain_state_path, None)
+    let mut chain_state = StacksChainState::open(true, chain_id, &chain_state_path, None, true)
         .expect("Failed to open stacks chain state")
         .0;
     let chain_tip = SortitionDB::get_canonical_burn_chain_tip(sort_db.conn())
@@ -1899,7 +1902,7 @@ fn analyze_sortition_mev(argv: Vec<String>) {
     let burnchain = Burnchain::new(&burnchaindb_path, "bitcoin", "mainnet").unwrap();
     let burnchaindb = BurnchainDB::connect(&burnchaindb_path, &burnchain, true).unwrap();
     let (mut chainstate, _) =
-        StacksChainState::open(true, 0x00000001, &chainstate_path, None).unwrap();
+        StacksChainState::open(true, 0x00000001, &chainstate_path, None, true).unwrap();
 
     let mut wins_epoch2 = BTreeMap::new();
     let mut wins_epoch3 = BTreeMap::new();

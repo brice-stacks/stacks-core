@@ -1436,8 +1436,9 @@ impl MemPoolDB {
             }
         }
 
-        let (chainstate, _) = StacksChainState::open(mainnet, chain_id, chainstate_path, None)
-            .map_err(|e| db_error::Other(format!("Failed to open chainstate: {:?}", &e)))?;
+        let (chainstate, _) =
+            StacksChainState::open(mainnet, chain_id, chainstate_path, None, false)
+                .map_err(|e| db_error::Other(format!("Failed to open chainstate: {:?}", &e)))?;
 
         let db_path = MemPoolDB::db_path(&chainstate.root_path)?;
 

@@ -77,6 +77,7 @@ fn cli_pick_best_tip(config_path: &str, at_stacks_height: Option<u64>) -> TipCan
         config.burnchain.chain_id,
         &stacks_chainstate_path,
         Some(config.node.get_marf_opts()),
+        true,
     )
     .unwrap();
     let mut sortdb = SortitionDB::open(&burn_db_path, false, burnchain.pox_constants).unwrap();
@@ -118,6 +119,7 @@ fn cli_get_miner_spend(
         config.burnchain.chain_id,
         &stacks_chainstate_path,
         Some(config.node.get_marf_opts()),
+        true,
     )
     .unwrap();
     let mut sortdb =

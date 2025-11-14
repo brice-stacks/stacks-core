@@ -663,6 +663,7 @@ impl<T: BlockEventDispatcher, U: RewardSetProvider, B: BurnchainHeaderReader>
             &format!("{}/chainstate/", path),
             Some(&mut boot_data),
             None,
+            false,
         )
         .unwrap();
         let canonical_sortition_tip =
@@ -1865,6 +1866,7 @@ impl SortitionDBMigrator {
             db_config.chain_id,
             chainstate_path,
             marf_opts,
+            false,
         )?;
         let burnchain_db = BurnchainDB::open(&burnchain.get_burnchaindb_path(), false)?;
 
@@ -1962,6 +1964,7 @@ pub fn migrate_chainstate_dbs(
             db_config.chain_id,
             chainstate_path,
             chainstate_marf_opts,
+            false,
         )?;
     }
     Ok(())

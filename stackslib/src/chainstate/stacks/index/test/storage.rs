@@ -139,7 +139,7 @@ fn load_store_trie_m_n_same(m: u64, n: u64, same: bool) {
 
     let marf_opts = MARFOpenOpts::default();
     let confirmed_marf_storage =
-        TrieFileStorage::<StacksBlockId>::open(&test_name, marf_opts).unwrap();
+        TrieFileStorage::<StacksBlockId>::open(&test_name, marf_opts, false).unwrap();
     let mut confirmed_marf = MARF::<StacksBlockId>::from_storage(confirmed_marf_storage);
 
     confirmed_marf

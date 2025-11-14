@@ -633,6 +633,7 @@ impl RunLoop {
             &self.config.get_chainstate_path_str(),
             Some(&mut boot_data),
             Some(self.config.node.get_marf_opts()),
+            false,
         )
         .unwrap();
         run_loop::announce_boot_receipts(
