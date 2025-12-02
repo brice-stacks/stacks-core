@@ -482,8 +482,104 @@ impl FromRow<StacksHeaderInfo> for StacksHeaderInfo {
     }
 }
 
-pub type StacksDBTx<'a> = IndexDBTx<'a, (), StacksBlockId>;
+pub struct StacksDBTx<'a> {
+    inner: IndexDBTx<'a, (), StacksBlockId>,
+}
+
+impl<'a> StacksDBTx<'a> {
+    pub fn new(index: &'a mut MARF<StacksBlockId>, context: ()) -> Self {
+        Self {
+            inner: IndexDBTx::new(index, context),
+        }
+    }
+
+    pub fn commit(self) -> Result<(), db_error> {
+        self.inner.commit()
+    }
+}
+
+impl<'a> Deref for StacksDBTx<'a> {
+    type Target = IndexDBTx<'a, (), StacksBlockId>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<'a> DerefMut for StacksDBTx<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
 pub type StacksDBConn<'a> = IndexDBConn<'a, (), StacksBlockId>;
+
+/// Read-only view over an existing chainstate, intended to be paired with an
+/// overlay/ephemeral write surface. This is scaffolding to gain access to the
+/// read APIs without opening a write transaction.
+#[derive(Clone, Copy)]
+pub struct StacksChainStateEphemeral<'a> {
+    pub(crate) base: &'a StacksChainState,
+}
+
+impl<'a> StacksChainStateEphemeral<'a> {
+    pub fn new(base: &'a StacksChainState) -> Self {
+        StacksChainStateEphemeral { base }
+    }
+
+    /// Read-only headers/index connection.
+    pub fn index_conn(&self) -> StacksDBConn<'_> {
+        StacksDBConn::new(&self.base.state_index, ())
+    }
+
+    /// Access the stored chainstate configuration.
+    pub fn config(&self) -> DBConfig {
+        self.base.config()
+    }
+
+    /// Build an in-memory overlay MARF that reads through to this chainstate's
+    /// on-disk headers/index. Callers are responsible for managing
+    /// setup/teardown of overlay views around write access.
+    pub fn overlay_index(&self) -> Result<MARF<StacksBlockId>, db_error> {
+        let mut open_opts = MARFOpenOpts::default();
+        open_opts.external_blobs = true;
+        let base_path = self.base.state_index.get_db_path().to_string();
+        MARF::from_overlay(&base_path, open_opts).map_err(db_error::IndexError)
+    }
+}
+
+pub struct OverlayChainstateContext {
+    overlay_marf: MARF<StacksBlockId>,
+    views_active: bool,
+}
+
+impl OverlayChainstateContext {
+    pub fn new(base: &StacksChainState) -> Result<Self, Error> {
+        let overlay = StacksChainStateEphemeral::new(base)
+            .overlay_index()
+            .map_err(Error::DBError)?;
+        overlay.setup_overlay_views().map_err(Error::from)?;
+        Ok(Self {
+            overlay_marf: overlay,
+            views_active: true,
+        })
+    }
+
+    pub fn tx(&mut self) -> StacksDBTx<'_> {
+        StacksDBTx::new(&mut self.overlay_marf, ())
+    }
+}
+
+impl Drop for OverlayChainstateContext {
+    fn drop(&mut self) {
+        if self.views_active {
+            if let Err(e) = self.overlay_marf.teardown_overlay_views() {
+                warn!("Failed tearing down overlay MARF views: {:?}", e);
+            }
+            self.views_active = false;
+        }
+    }
+}
 
 pub struct ClarityTx<'a, 'b> {
     block: ClarityBlockConnection<'a, 'b>,
@@ -1983,6 +2079,30 @@ impl StacksChainState {
         let chainstate_tx =
             ChainstateTx::new(inner_tx, blocks_path, self.root_path.clone(), config);
 
+        Ok((chainstate_tx, clarity_instance))
+    }
+
+    /// Build a context for executing overlay transactions against the chainstate.
+    /// The returned context owns the overlay MARF and must outlive any transactions
+    /// created from it.
+    pub fn new_overlay_context(&self) -> Result<OverlayChainstateContext, Error> {
+        OverlayChainstateContext::new(self)
+    }
+
+    /// Begin a chainstate transaction that uses an in-memory overlay for writes.
+    /// Callers must keep `overlay_ctx` alive for the duration of the transaction.
+    pub fn overlay_chainstate_tx_begin<'a>(
+        &'a mut self,
+        overlay_ctx: &'a mut OverlayChainstateContext,
+    ) -> Result<(ChainstateTx<'a>, &'a mut ClarityInstance), Error> {
+        let config = self.config();
+        let blocks_path = self.blocks_path.clone();
+        let inner_tx = overlay_ctx.tx();
+
+        let chainstate_tx =
+            ChainstateTx::new(inner_tx, blocks_path, self.root_path.clone(), config);
+
+        let clarity_instance = &mut self.clarity_state;
         Ok((chainstate_tx, clarity_instance))
     }
 

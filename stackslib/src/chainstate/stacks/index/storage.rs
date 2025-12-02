@@ -22,6 +22,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::{fmt, fs, io};
 
+use clarity::types::sqlite::NO_PARAMS;
 use rusqlite::{Connection, OpenFlags, Transaction};
 use sha2::Digest;
 use stacks_common::types::chainstate::{
@@ -1343,6 +1344,96 @@ impl<'a, T: MarfTrieId> ReopenedTrieStorageConnection<'a, T> {
 }
 
 impl<T: MarfTrieId> TrieFileStorage<T> {
+    /// Attach another MARF sqlite DB in read-only mode so that this storage can
+    /// read through to it. This is intended for overlay/ephemeral use-cases
+    /// where writes go to this connection while reads fall back to the attached
+    /// base.
+    pub fn attach_readonly_base(&self, base_db_path: &str) -> Result<(), Error> {
+        self.db
+            .execute(
+                "ATTACH DATABASE ?1 AS readonly_base",
+                rusqlite::params![base_db_path],
+            )
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
+    /// Set up temp views so reads of MARF tables see union of this storage and
+    /// the attached base (`readonly_base`). Call `teardown_overlay_views` before
+    /// performing writes.
+    pub fn setup_overlay_views(&self) -> Result<(), Error> {
+        // marf_data holds the serialized tries; mined_blocks holds unconfirmed data.
+        self.db
+            .execute(
+                "ALTER TABLE marf_data RENAME TO overlay_marf_data",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
+        self.db
+            .execute(
+                "CREATE TEMP VIEW marf_data AS \
+                 SELECT * FROM main.overlay_marf_data \
+                 UNION ALL SELECT * FROM readonly_base.marf_data",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
+
+        self.db
+            .execute(
+                "ALTER TABLE mined_blocks RENAME TO overlay_mined_blocks",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
+        self.db
+            .execute(
+                "CREATE TEMP VIEW mined_blocks AS \
+                 SELECT * FROM main.overlay_mined_blocks \
+                 UNION ALL SELECT * FROM readonly_base.mined_blocks",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
+
+        Ok(())
+    }
+
+    /// Remove the temp views created by `setup_overlay_views` and restore the
+    /// original table names.
+    pub fn teardown_overlay_views(&self) -> Result<(), Error> {
+        self.db
+            .execute("DROP VIEW IF EXISTS marf_data", NO_PARAMS)
+            .map_err(Error::from)?;
+        self.db
+            .execute("DROP VIEW IF EXISTS mined_blocks", NO_PARAMS)
+            .map_err(Error::from)?;
+
+        self.db
+            .execute(
+                "ALTER TABLE overlay_marf_data RENAME TO marf_data",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
+        self.db
+            .execute(
+                "ALTER TABLE overlay_mined_blocks RENAME TO mined_blocks",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
+    /// Create a RAM-backed TrieFileStorage and attach an on-disk MARF for
+    /// read-through. Callers should pair this with `setup_overlay_views` and
+    /// `teardown_overlay_views` around write boundaries.
+    pub fn new_overlay_from_base(
+        base_db_path: &str,
+        marf_opts: MARFOpenOpts,
+    ) -> Result<TrieFileStorage<T>, Error> {
+        // RAM-backed
+        let overlay = TrieFileStorage::open(":memory:", marf_opts, false)?;
+        overlay.attach_readonly_base(base_db_path)?;
+        Ok(overlay)
+    }
+
     pub fn connection(&mut self) -> TrieStorageConnection<'_, T> {
         TrieStorageConnection {
             db: SqliteConnection::ConnRef(&self.db),

@@ -1151,6 +1151,17 @@ impl<T: MarfTrieId> MARF<T> {
         }
     }
 
+    /// Build an overlay MARF that reads through to an on-disk base (attached
+    /// read-only) while storing new writes in an in-memory backing store.
+    /// Callers that intend to write must tear down the overlay views before
+    /// mutating and restore them afterwards (see
+    /// `TrieFileStorage::setup_overlay_views/teardown_overlay_views`).
+    pub fn from_overlay(base_db_path: &str, open_opts: MARFOpenOpts) -> Result<MARF<T>, Error> {
+        let storage = TrieFileStorage::new_overlay_from_base(base_db_path, open_opts)?;
+        // overlay is ready for read-through; caller controls view lifecycle
+        Ok(MARF::from_storage(storage))
+    }
+
     /// Instantiate the MARF using a TrieFileStorage instance, from the given path on disk.
     /// This will have the side-effect of instantiating a new fork table from the tries encoded on
     /// disk. Performant code should call this method sparingly.
@@ -1667,5 +1678,15 @@ impl<T: MarfTrieId> MARF<T> {
     /// Get the underlying storage DB path
     pub fn get_db_path(&self) -> &str {
         &self.storage.db_path
+    }
+
+    /// Enable overlay read-through views so reads can fall back to an attached base MARF.
+    pub fn setup_overlay_views(&self) -> Result<(), Error> {
+        self.storage.setup_overlay_views()
+    }
+
+    /// Tear down overlay views and restore the original table names.
+    pub fn teardown_overlay_views(&self) -> Result<(), Error> {
+        self.storage.teardown_overlay_views()
     }
 }

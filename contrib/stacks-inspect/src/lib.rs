@@ -1200,7 +1200,19 @@ fn replay_block_nakamoto(
             );
             ChainstateError::NoSuchBlockError
         })?;
-    let (mut chainstate_tx, clarity_instance) = stacks_chain_state.chainstate_tx_begin()?;
+
+    let mut overlay_ctx = stacks_chain_state.new_overlay_context().map_err(|e| {
+        warn!(
+            "Cannot process Nakamoto block: failed to build overlay context";
+            "err" => ?e,
+            "consensus_hash" => %block.header.consensus_hash,
+            "stacks_block_hash" => %block.header.block_hash(),
+            "stacks_block_id" => %block.header.block_id()
+        );
+        ChainstateError::InvalidChainstateDB
+    })?;
+    let (mut chainstate_tx, clarity_instance) =
+        stacks_chain_state.overlay_chainstate_tx_begin(&mut overlay_ctx)?;
 
     // find parent header
     let Some(parent_header_info) =
