@@ -792,6 +792,81 @@ pub struct SortitionHandleContext {
 pub type SortitionDBConn<'a> = IndexDBConn<'a, SortitionDBTxContext, SortitionId>;
 pub type SortitionDBTx<'a> = IndexDBTx<'a, SortitionDBTxContext, SortitionId>;
 
+/// Overlay context for operating on a RAM-backed copy of the sortition MARF.
+pub struct SortitionOverlayContext {
+    overlay_marf: MARF<SortitionId>,
+    views_active: bool,
+    tx_context: SortitionDBTxContext,
+    handle_context: SortitionHandleContext,
+}
+
+impl SortitionOverlayContext {
+    fn overlay_marf(base: &SortitionDB) -> Result<MARF<SortitionId>, db_error> {
+        let mut open_opts = MARFOpenOpts::default();
+        open_opts.external_blobs = true;
+        let base_path = base.marf.get_db_path().to_string();
+        MARF::from_overlay(&base_path, open_opts).map_err(db_error::IndexError)
+    }
+
+    pub fn new(base: &SortitionDB) -> Result<Self, db_error> {
+        let overlay = Self::overlay_marf(base)?;
+        overlay
+            .setup_overlay_views()
+            .map_err(db_error::IndexError)?;
+        let tip = SortitionDB::get_canonical_sortition_tip(base.conn())?;
+        Ok(Self {
+            overlay_marf: overlay,
+            views_active: true,
+            tx_context: SortitionDBTxContext {
+                first_block_height: base.first_block_height,
+                pox_constants: base.pox_constants.clone(),
+                dryrun: base.dryrun,
+            },
+            handle_context: SortitionHandleContext {
+                first_block_height: base.first_block_height,
+                pox_constants: base.pox_constants.clone(),
+                chain_tip: tip,
+                dryrun: base.dryrun,
+            },
+        })
+    }
+
+    pub fn tx_handle_begin(&mut self) -> SortitionHandleTx<'_> {
+        SortitionHandleTx::new(&mut self.overlay_marf, self.handle_context.clone())
+    }
+
+    pub fn index_handle_for(&self, chain_tip: &SortitionId) -> SortitionHandleConn<'_> {
+        let mut ctx = self.handle_context.clone();
+        ctx.chain_tip = chain_tip.clone();
+        SortitionHandleConn::new(&self.overlay_marf, ctx)
+    }
+
+    pub fn index_handle_at_ch(
+        &self,
+        sort_db: &SortitionDB,
+        ch: &ConsensusHash,
+    ) -> Result<SortitionHandleConn<'_>, db_error> {
+        let sortition_id = SortitionDB::get_sortition_id_by_consensus(sort_db.conn(), ch)?
+            .ok_or(db_error::NotFoundError)?;
+        Ok(self.index_handle_for(&sortition_id))
+    }
+
+    pub fn tx_context(&self) -> SortitionDBTxContext {
+        self.tx_context.clone()
+    }
+}
+
+impl Drop for SortitionOverlayContext {
+    fn drop(&mut self) {
+        if self.views_active {
+            if let Err(e) = self.overlay_marf.teardown_overlay_views() {
+                warn!("Failed to tear down overlay sortition MARF views: {:?}", e);
+            }
+            self.views_active = false;
+        }
+    }
+}
+
 ///
 /// These structs are used to keep an open "handle" to the
 ///   sortition db -- this is just the db/marf connection
@@ -2576,6 +2651,10 @@ impl SortitionDB {
                 dryrun: self.dryrun,
             },
         )
+    }
+
+    pub fn new_overlay_context(&self) -> Result<SortitionOverlayContext, db_error> {
+        SortitionOverlayContext::new(self)
     }
 
     pub fn index_handle<'a>(&'a self, chain_tip: &SortitionId) -> SortitionHandleConn<'a> {

@@ -20,7 +20,10 @@
 use std::io::Write;
 
 use rusqlite::blob::Blob;
-use rusqlite::{params, Connection, DatabaseName, OptionalExtension, Transaction};
+use rusqlite::{
+    params, Connection, DatabaseName, Error as SqliteError, ErrorCode, OptionalExtension,
+    Transaction,
+};
 use stacks_common::types::chainstate::TrieHash;
 use stacks_common::types::sqlite::NO_PARAMS;
 
@@ -93,7 +96,11 @@ pub fn create_tables_if_needed(conn: &mut Connection) -> Result<(), Error> {
 
 fn get_schema_version(conn: &Connection) -> u64 {
     // if the table doesn't exist, then the version is 1.
-    let sql = "SELECT version FROM schema_version";
+    let sql = if overlay_attached(conn) {
+        "SELECT version FROM readonly_base.schema_version"
+    } else {
+        "SELECT version FROM schema_version"
+    };
     match conn.query_row(sql, NO_PARAMS, |row| row.get::<_, i64>("version")) {
         Ok(x) => x as u64,
         Err(e) => {
@@ -106,7 +113,11 @@ fn get_schema_version(conn: &Connection) -> u64 {
 /// Get the last schema version before the last attempted migration
 fn get_migrated_version(conn: &Connection) -> u64 {
     // if the table doesn't exist, then the version is 1.
-    let sql = "SELECT version FROM migrated_version";
+    let sql = if overlay_attached(conn) {
+        "SELECT version FROM readonly_base.migrated_version"
+    } else {
+        "SELECT version FROM migrated_version"
+    };
     match conn.query_row(sql, NO_PARAMS, |row| row.get::<_, i64>("version")) {
         Ok(x) => x as u64,
         Err(e) => {
@@ -119,6 +130,9 @@ fn get_migrated_version(conn: &Connection) -> u64 {
 /// Migrate the MARF database to the currently-supported schema.
 /// Returns the version of the DB prior to the migration.
 pub fn migrate_tables_if_needed<T: MarfTrieId>(conn: &mut Connection) -> Result<u64, Error> {
+    if overlay_attached(conn) {
+        return Ok(get_schema_version(conn));
+    }
     let first_version = get_schema_version(conn);
     loop {
         let version = get_schema_version(conn);
@@ -380,6 +394,18 @@ pub fn write_trie_blob_to_unconfirmed<T: MarfTrieId>(
     Ok(block_id)
 }
 
+pub fn overlay_attached(conn: &Connection) -> bool {
+    let mut found = false;
+    let _ = conn.pragma_query(None, "database_list", |row| {
+        let name: String = row.get(1)?;
+        if name == "readonly_base" {
+            found = true;
+        }
+        Ok(())
+    });
+    found
+}
+
 /// Open a trie blob. Returns a Blob<'a> readable/writeable handle to it.
 pub fn open_trie_blob(conn: &Connection, block_id: u32) -> Result<Blob<'_>, Error> {
     let blob = conn.blob_open(
@@ -394,14 +420,67 @@ pub fn open_trie_blob(conn: &Connection, block_id: u32) -> Result<Blob<'_>, Erro
 
 /// Open a trie blob. Returns a Blob<'a> readable handle to it.
 pub fn open_trie_blob_readonly(conn: &Connection, block_id: u32) -> Result<Blob<'_>, Error> {
-    let blob = conn.blob_open(
-        DatabaseName::Main,
-        "marf_data",
-        "data",
-        block_id.into(),
-        false,
-    )?;
-    Ok(blob)
+    if overlay_attached(conn) {
+        debug!(
+            "Overlay MARF blob open request for block_id {} (readonly)",
+            block_id
+        );
+        match conn.blob_open(
+            DatabaseName::Main,
+            "overlay_marf_data",
+            "data",
+            block_id.into(),
+            false,
+        ) {
+            Ok(blob) => {
+                debug!(
+                    "Overlay MARF blob open succeeded in overlay table for block_id {}",
+                    block_id
+                );
+                Ok(blob)
+            }
+            Err(SqliteError::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: ErrorCode::NotFound,
+                    ..
+                },
+                _,
+            )) => {
+                debug!(
+                    "Overlay MARF blob not found in overlay table for block_id {}, falling back to base",
+                    block_id
+                );
+                conn.blob_open(
+                    DatabaseName::Attached("readonly_base"),
+                    "marf_data",
+                    "data",
+                    block_id.into(),
+                    false,
+                )
+                .map_err(Error::from)
+            }
+            Err(e) => {
+                debug!(
+                    "Overlay MARF blob open failed on overlay table for block_id {}: {:?}",
+                    block_id, e
+                );
+                Err(Error::from(e))
+            }
+        }
+    } else {
+        debug!(
+            "Overlay MARF blob open request without overlay tables for block_id {}",
+            block_id
+        );
+        let blob = conn.blob_open(
+            DatabaseName::Main,
+            "marf_data",
+            "data",
+            block_id.into(),
+            false,
+        )?;
+        Ok(blob)
+    }
 }
 
 #[cfg(test)]

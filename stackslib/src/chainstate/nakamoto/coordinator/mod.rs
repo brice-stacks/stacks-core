@@ -176,7 +176,7 @@ impl<T: BlockEventDispatcher> OnChainRewardSetProvider<'_, T> {
     pub fn read_reward_set_at_calculated_block(
         &self,
         coinbase_height_of_calculation: u64,
-        chainstate: &mut StacksChainState,
+        chainstate: &StacksChainState,
         block_id: &StacksBlockId,
         debug_log: bool,
     ) -> Result<RewardSet, Error> {

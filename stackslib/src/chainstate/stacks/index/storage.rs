@@ -23,7 +23,7 @@ use std::path::Path;
 use std::{fmt, fs, io};
 
 use clarity::types::sqlite::NO_PARAMS;
-use rusqlite::{Connection, OpenFlags, Transaction};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 use sha2::Digest;
 use stacks_common::types::chainstate::{
     TrieHash, BLOCK_HEADER_HASH_ENCODED_SIZE, TRIEHASH_ENCODED_SIZE,
@@ -1197,6 +1197,8 @@ pub struct TrieStorageConnection<'a, T: MarfTrieId> {
     cache: &'a mut TrieCache<T>,
     bench: &'a mut TrieBenchmark,
     pub hash_calculation_mode: TrieHashCalculationMode,
+    blob_read_path: Option<&'a str>,
+    force_inline_blobs: bool,
 
     /// row ID of a trie that represents unconfirmed state (i.e. trie state that will never become
     /// part of the MARF, but nevertheless represents a persistent scratch space).  If this field
@@ -1263,6 +1265,8 @@ pub struct TrieFileStorage<T: MarfTrieId> {
     cache: TrieCache<T>,
     bench: TrieBenchmark,
     hash_calculation_mode: TrieHashCalculationMode,
+    blob_read_path: Option<String>,
+    force_inline_blobs: bool,
 
     // used in testing in order to short-circuit block-height lookups
     //   when the trie struct is tested outside of marf.rs usage
@@ -1307,6 +1311,8 @@ pub struct ReopenedTrieStorageConnection<'a, T: MarfTrieId> {
     cache: TrieCache<T>,
     bench: TrieBenchmark,
     pub hash_calculation_mode: TrieHashCalculationMode,
+    blob_read_path: Option<String>,
+    force_inline_blobs: bool,
 
     /// row ID of a trie that represents unconfirmed state (i.e. trie state that will never become
     /// part of the MARF, but nevertheless represents a persistent scratch space).  If this field
@@ -1336,6 +1342,8 @@ impl<'a, T: MarfTrieId> ReopenedTrieStorageConnection<'a, T> {
             bench: &mut self.bench,
             hash_calculation_mode: self.hash_calculation_mode,
             unconfirmed_block_id: None,
+            blob_read_path: self.blob_read_path.as_deref(),
+            force_inline_blobs: self.force_inline_blobs,
 
             #[cfg(test)]
             test_genesis_block: &mut self.test_genesis_block,
@@ -1358,37 +1366,264 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         Ok(())
     }
 
+    fn blob_storage_path(&self) -> &str {
+        self.blob_read_path.as_deref().unwrap_or(&self.db_path)
+    }
+
     /// Set up temp views so reads of MARF tables see union of this storage and
     /// the attached base (`readonly_base`). Call `teardown_overlay_views` before
     /// performing writes.
     pub fn setup_overlay_views(&self) -> Result<(), Error> {
-        // marf_data holds the serialized tries; mined_blocks holds unconfirmed data.
+        // Cleanup
         self.db
-            .execute(
-                "ALTER TABLE marf_data RENAME TO overlay_marf_data",
-                NO_PARAMS,
-            )
+            .execute("DROP TABLE IF EXISTS main.overlay_marf_data", NO_PARAMS)
             .map_err(Error::from)?;
         self.db
-            .execute(
-                "CREATE TEMP VIEW marf_data AS \
-                 SELECT * FROM main.overlay_marf_data \
-                 UNION ALL SELECT * FROM readonly_base.marf_data",
-                NO_PARAMS,
-            )
+            .execute("DROP TABLE IF EXISTS main.overlay_mined_blocks", NO_PARAMS)
             .map_err(Error::from)?;
+        self.db
+            .execute("DROP TABLE IF EXISTS main.overlay__fork_storage", NO_PARAMS)
+            .map_err(Error::from)?;
+        self.db
+            .execute("DROP VIEW IF EXISTS temp.marf_data", NO_PARAMS)
+            .map_err(Error::from)?;
+        self.db
+            .execute("DROP VIEW IF EXISTS temp.mined_blocks", NO_PARAMS)
+            .map_err(Error::from)?;
+        self.db
+            .execute("DROP VIEW IF EXISTS temp.__fork_storage", NO_PARAMS)
+            .map_err(Error::from)?;
+
+        {
+            // CLONE & SWAP (Instead of RENAME because RENAME fails if indices exist)
+            // We read the schema of 'marf_data' to recreate it exactly as 'overlay_marf_data'
+            let create_sql: String = self
+                .db
+                .query_row(
+                    "SELECT sql FROM readonly_base.sqlite_master WHERE type='table' AND name='marf_data'",
+                    NO_PARAMS,
+                    |row| row.get(0),
+                )
+                .map_err(Error::from)?;
+            let overlay_sql = create_sql.replace("marf_data", "overlay_marf_data");
+            self.db
+                .execute(&overlay_sql, NO_PARAMS)
+                .map_err(Error::from)?;
+
+            // Copy all data to the new table
+            self.db
+                .execute(
+                    "INSERT INTO overlay_marf_data SELECT * FROM marf_data",
+                    NO_PARAMS,
+                )
+                .map_err(Error::from)?;
+
+            // Drop the old table.
+            // This automatically cleans up ALL indices (including constraints) attached to it.
+            self.db
+                .execute("DROP TABLE marf_data", NO_PARAMS)
+                .map_err(Error::from)?;
+
+            self.db
+                .execute(
+                    "CREATE TEMP VIEW marf_data AS \
+                        SELECT * FROM main.overlay_marf_data \
+                        UNION ALL SELECT * FROM readonly_base.marf_data",
+                    NO_PARAMS,
+                )
+                .map_err(Error::from)?;
+        }
+
+        {
+            let create_sql: String = self
+                .db
+                .query_row(
+                    "SELECT sql FROM readonly_base.sqlite_master WHERE type='table' AND name='mined_blocks'",
+                    NO_PARAMS,
+                    |row| row.get(0),
+                )
+                .map_err(Error::from)?;
+
+            let overlay_sql = create_sql.replace("mined_blocks", "overlay_mined_blocks");
+            self.db
+                .execute(&overlay_sql, NO_PARAMS)
+                .map_err(Error::from)?;
+
+            self.db
+                .execute(
+                    "INSERT INTO overlay_mined_blocks SELECT * FROM mined_blocks",
+                    NO_PARAMS,
+                )
+                .map_err(Error::from)?;
+
+            self.db
+                .execute("DROP TABLE mined_blocks", NO_PARAMS)
+                .map_err(Error::from)?;
+
+            self.db
+                .execute(
+                    "CREATE TEMP VIEW mined_blocks AS \
+                        SELECT * FROM main.overlay_mined_blocks \
+                        UNION ALL SELECT * FROM readonly_base.mined_blocks",
+                    NO_PARAMS,
+                )
+                .map_err(Error::from)?;
+        }
+
+        {
+            let create_sql: String = self
+                .db
+                .query_row(
+                    "SELECT sql FROM readonly_base.sqlite_master WHERE type='table' AND name='__fork_storage'",
+                    NO_PARAMS,
+                    |row| row.get(0),
+                )
+                .map_err(Error::from)?;
+
+            let overlay_sql = create_sql.replace("__fork_storage", "overlay__fork_storage");
+            self.db
+                .execute(&overlay_sql, NO_PARAMS)
+                .map_err(Error::from)?;
+
+            let main_has_fork: bool = self
+                .db
+                .query_row(
+                    "SELECT EXISTS( \
+                        SELECT 1 FROM main.sqlite_master \
+                        WHERE type='table' AND name='__fork_storage' \
+                    )",
+                    NO_PARAMS,
+                    |row| row.get(0),
+                )
+                .map_err(Error::from)?;
+
+            if main_has_fork {
+                self.db
+                    .execute(
+                        "INSERT INTO overlay__fork_storage \
+                            SELECT * FROM main.__fork_storage",
+                        NO_PARAMS,
+                    )
+                    .map_err(Error::from)?;
+
+                self.db
+                    .execute("DROP TABLE main.__fork_storage", NO_PARAMS)
+                    .map_err(Error::from)?;
+            }
+
+            self.db
+                .execute(
+                    "CREATE TEMP VIEW __fork_storage AS \
+                        SELECT * FROM main.overlay__fork_storage \
+                        UNION ALL SELECT * FROM readonly_base.__fork_storage",
+                    NO_PARAMS,
+                )
+                .map_err(Error::from)?;
+        }
 
         self.db
             .execute(
-                "ALTER TABLE mined_blocks RENAME TO overlay_mined_blocks",
+                "CREATE TEMP TRIGGER overlay_marf_data_insert \
+                 INSTEAD OF INSERT ON marf_data \
+                 BEGIN \
+                     INSERT INTO overlay_marf_data(block_hash, data, unconfirmed, external_offset, external_length) \
+                     VALUES (NEW.block_hash, NEW.data, NEW.unconfirmed, \
+                             COALESCE(NEW.external_offset, 0), COALESCE(NEW.external_length, 0)); \
+                 END",
                 NO_PARAMS,
             )
             .map_err(Error::from)?;
         self.db
             .execute(
-                "CREATE TEMP VIEW mined_blocks AS \
-                 SELECT * FROM main.overlay_mined_blocks \
-                 UNION ALL SELECT * FROM readonly_base.mined_blocks",
+                "CREATE TEMP TRIGGER overlay_marf_data_update \
+                 INSTEAD OF UPDATE ON marf_data \
+                 BEGIN \
+                     UPDATE overlay_marf_data SET \
+                         block_hash = NEW.block_hash, \
+                         data = NEW.data, \
+                         unconfirmed = NEW.unconfirmed, \
+                         external_offset = COALESCE(NEW.external_offset, 0), \
+                         external_length = COALESCE(NEW.external_length, 0) \
+                     WHERE block_id = OLD.block_id; \
+                 END",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
+        self.db
+            .execute(
+                "CREATE TEMP TRIGGER overlay_marf_data_delete \
+                 INSTEAD OF DELETE ON marf_data \
+                 BEGIN \
+                     DELETE FROM overlay_marf_data WHERE block_id = OLD.block_id; \
+                 END",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
+        self.db
+            .execute(
+                "CREATE TEMP TRIGGER overlay_mined_blocks_insert \
+                 INSTEAD OF INSERT ON mined_blocks \
+                 BEGIN \
+                     INSERT INTO overlay_mined_blocks(block_hash, data) \
+                     VALUES (NEW.block_hash, NEW.data); \
+                 END",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
+        self.db
+            .execute(
+                "CREATE TEMP TRIGGER overlay_mined_blocks_update \
+                 INSTEAD OF UPDATE ON mined_blocks \
+                 BEGIN \
+                     UPDATE overlay_mined_blocks SET \
+                         block_hash = NEW.block_hash, \
+                         data = NEW.data \
+                     WHERE block_id = OLD.block_id; \
+                 END",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
+        self.db
+            .execute(
+                "CREATE TEMP TRIGGER overlay_mined_blocks_delete \
+                 INSTEAD OF DELETE ON mined_blocks \
+                 BEGIN \
+                     DELETE FROM overlay_mined_blocks WHERE block_id = OLD.block_id; \
+                 END",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
+        self.db
+            .execute(
+                "CREATE TEMP TRIGGER overlay_fork_storage_insert \
+                 INSTEAD OF INSERT ON __fork_storage \
+                 BEGIN \
+                     INSERT OR REPLACE INTO overlay__fork_storage(value_hash, value) \
+                     VALUES (NEW.value_hash, NEW.value); \
+                 END",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
+        self.db
+            .execute(
+                "CREATE TEMP TRIGGER overlay_fork_storage_update \
+                 INSTEAD OF UPDATE ON __fork_storage \
+                 BEGIN \
+                     UPDATE overlay__fork_storage SET \
+                         value_hash = NEW.value_hash, \
+                         value = NEW.value \
+                     WHERE value_hash = OLD.value_hash; \
+                 END",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
+        self.db
+            .execute(
+                "CREATE TEMP TRIGGER overlay_fork_storage_delete \
+                 INSTEAD OF DELETE ON __fork_storage \
+                 BEGIN \
+                     DELETE FROM overlay__fork_storage WHERE value_hash = OLD.value_hash; \
+                 END",
                 NO_PARAMS,
             )
             .map_err(Error::from)?;
@@ -1400,10 +1635,59 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
     /// original table names.
     pub fn teardown_overlay_views(&self) -> Result<(), Error> {
         self.db
+            .execute("DROP TRIGGER IF EXISTS overlay_marf_data_insert", NO_PARAMS)
+            .map_err(Error::from)?;
+        self.db
+            .execute("DROP TRIGGER IF EXISTS overlay_marf_data_update", NO_PARAMS)
+            .map_err(Error::from)?;
+        self.db
+            .execute("DROP TRIGGER IF EXISTS overlay_marf_data_delete", NO_PARAMS)
+            .map_err(Error::from)?;
+        self.db
+            .execute(
+                "DROP TRIGGER IF EXISTS overlay_mined_blocks_insert",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
+        self.db
+            .execute(
+                "DROP TRIGGER IF EXISTS overlay_mined_blocks_update",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
+        self.db
+            .execute(
+                "DROP TRIGGER IF EXISTS overlay_mined_blocks_delete",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
+        self.db
+            .execute(
+                "DROP TRIGGER IF EXISTS overlay_fork_storage_insert",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
+        self.db
+            .execute(
+                "DROP TRIGGER IF EXISTS overlay_fork_storage_update",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
+        self.db
+            .execute(
+                "DROP TRIGGER IF EXISTS overlay_fork_storage_delete",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
+
+        self.db
             .execute("DROP VIEW IF EXISTS marf_data", NO_PARAMS)
             .map_err(Error::from)?;
         self.db
             .execute("DROP VIEW IF EXISTS mined_blocks", NO_PARAMS)
+            .map_err(Error::from)?;
+        self.db
+            .execute("DROP VIEW IF EXISTS __fork_storage", NO_PARAMS)
             .map_err(Error::from)?;
 
         self.db
@@ -1418,6 +1702,38 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
                 NO_PARAMS,
             )
             .map_err(Error::from)?;
+        self.db
+            .execute(
+                "ALTER TABLE overlay__fork_storage RENAME TO __fork_storage",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
+
+        // re-create indexes we dropped earlier
+        self.db
+            .execute(
+                "CREATE INDEX IF NOT EXISTS block_hash_marf_data ON marf_data(block_hash)",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
+        self.db
+            .execute(
+                "CREATE INDEX IF NOT EXISTS unconfirmed_marf_data ON marf_data(unconfirmed)",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
+        self.db
+            .execute(
+                "CREATE INDEX IF NOT EXISTS index_external_offset ON marf_data(external_offset)",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
+        self.db
+            .execute(
+                "CREATE INDEX IF NOT EXISTS block_hash_mined_blocks ON mined_blocks(block_hash)",
+                NO_PARAMS,
+            )
+            .map_err(Error::from)?;
         Ok(())
     }
 
@@ -1429,8 +1745,15 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         marf_opts: MARFOpenOpts,
     ) -> Result<TrieFileStorage<T>, Error> {
         // RAM-backed
-        let overlay = TrieFileStorage::open(":memory:", marf_opts, false)?;
+        let mut overlay = TrieFileStorage::open(":memory:", marf_opts, false)?;
         overlay.attach_readonly_base(base_db_path)?;
+        overlay.force_inline_blobs = true;
+        overlay.blob_read_path = Some(base_db_path.to_string());
+        if TrieFile::exists(base_db_path)? {
+            overlay.blobs = Some(TrieFile::from_db_path(base_db_path, true)?);
+        } else {
+            overlay.blobs = None;
+        }
         Ok(overlay)
     }
 
@@ -1444,6 +1767,8 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
             bench: &mut self.bench,
             hash_calculation_mode: self.hash_calculation_mode,
             unconfirmed_block_id: None,
+            blob_read_path: self.blob_read_path.as_deref(),
+            force_inline_blobs: self.force_inline_blobs,
 
             #[cfg(test)]
             test_genesis_block: &mut self.test_genesis_block,
@@ -1477,7 +1802,7 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         // perf note: should we attempt to clone the cache
         let cache = TrieCache::default();
         let blobs = if self.blobs.is_some() {
-            Some(TrieFile::from_db_path(&self.db_path, true)?)
+            Some(TrieFile::from_db_path(self.blob_storage_path(), true)?)
         } else {
             None
         };
@@ -1493,6 +1818,8 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
             bench,
             hash_calculation_mode,
             unconfirmed_block_id,
+            blob_read_path: self.blob_read_path.clone(),
+            force_inline_blobs: self.force_inline_blobs,
             #[cfg(test)]
             test_genesis_block: self.test_genesis_block.clone(),
         })
@@ -1513,6 +1840,8 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
             bench: &mut self.bench,
             hash_calculation_mode: self.hash_calculation_mode,
             unconfirmed_block_id: None,
+            blob_read_path: self.blob_read_path.as_deref(),
+            force_inline_blobs: self.force_inline_blobs,
 
             #[cfg(test)]
             test_genesis_block: &mut self.test_genesis_block,
@@ -1612,6 +1941,8 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
             blobs,
             bench: TrieBenchmark::new(),
             hash_calculation_mode: marf_opts.hash_calculation_mode,
+            blob_read_path: None,
+            force_inline_blobs: false,
 
             data: TrieStorageTransientData {
                 uncommitted_writes: None,
@@ -1690,7 +2021,7 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         let db = marf_sqlite_open(&self.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY, false)?;
         let cache = TrieCache::default();
         let blobs = if self.blobs.is_some() {
-            Some(TrieFile::from_db_path(&self.db_path, true)?)
+            Some(TrieFile::from_db_path(self.blob_storage_path(), true)?)
         } else {
             None
         };
@@ -1705,6 +2036,8 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
             cache,
             bench: TrieBenchmark::new(),
             hash_calculation_mode: self.hash_calculation_mode,
+            blob_read_path: self.blob_read_path.clone(),
+            force_inline_blobs: self.force_inline_blobs,
 
             data: TrieStorageTransientData {
                 uncommitted_writes: self.data.uncommitted_writes.clone(),
@@ -1774,6 +2107,8 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
             cache,
             bench: TrieBenchmark::new(),
             hash_calculation_mode: self.hash_calculation_mode,
+            blob_read_path: self.blob_read_path.map(|s| s.to_string()),
+            force_inline_blobs: self.force_inline_blobs,
 
             data: TrieStorageTransientData {
                 uncommitted_writes: None,
@@ -1809,10 +2144,15 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
     where
         F: FnOnce(&Connection, &mut Option<&mut TrieFile>) -> R,
     {
-        let mut blobs = self.blobs.take();
-        let res = cls(&self.db, &mut blobs);
-        self.blobs = blobs;
-        res
+        if self.force_inline_blobs {
+            let mut inline: Option<&mut TrieFile> = None;
+            cls(&self.db, &mut inline)
+        } else {
+            let mut blobs = self.blobs.take();
+            let res = cls(&self.db, &mut blobs);
+            self.blobs = blobs;
+            res
+        }
     }
 
     /// Inner method for flushing the UncommittedState's TrieRAM to disk.
@@ -2134,6 +2474,22 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
 
     pub fn clear_cached_ancestor_hashes_bytes(&mut self) {
         self.data.trie_ancestor_hash_bytes_cache = None;
+    }
+
+    fn block_uses_external_blobs(&self, block_id: u32) -> Result<bool, Error> {
+        if self.blobs.is_none() {
+            return Ok(false);
+        }
+        let conn: &Connection = &self.db;
+        let len: Option<i64> = conn
+            .query_row(
+                "SELECT external_length FROM marf_data WHERE block_id = ?1",
+                rusqlite::params![block_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Error::from)?;
+        Ok(len.unwrap_or(0) != 0)
     }
 
     pub fn get_root_hash_at(&mut self, tip: &T) -> Result<TrieHash, Error> {
@@ -2497,16 +2853,15 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
 
         trace!("write_children_hashes for {:?}", node);
 
-        let mut map = TrieSqlHashMapCursor {
-            db: &self.db,
-            cache: self.cache,
-            unconfirmed: self.data.unconfirmed,
-        };
-
         if let Some((ref uncommitted_bhh, ref mut uncommitted_trie)) = self.data.uncommitted_writes
         {
             if &self.data.cur_block == uncommitted_bhh {
                 // storage currently points to uncommitted state
+                let mut map = TrieSqlHashMapCursor {
+                    db: &self.db,
+                    cache: self.cache,
+                    unconfirmed: self.data.unconfirmed,
+                };
                 let start_time = self.bench.write_children_hashes_start();
                 let res = TrieStorageConnection::<T>::inner_write_children_hashes(
                     uncommitted_trie.trie_ram_mut(),
@@ -2521,13 +2876,24 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
         }
 
         // storage points to committed state
-        if let Some(blobs) = self.blobs.as_mut() {
-            // tries stored on file
+        let block_id = self.data.cur_block_id.ok_or_else(|| {
+            error!("Failed to get cur block as hash reader");
+            Error::NotFoundError
+        })?;
+
+        let use_external = self.block_uses_external_blobs(block_id)?;
+        let mut map = TrieSqlHashMapCursor {
+            db: &self.db,
+            cache: self.cache,
+            unconfirmed: self.data.unconfirmed,
+        };
+
+        if use_external {
             let start_time = self.bench.write_children_hashes_start();
-            let block_id = self.data.cur_block_id.ok_or_else(|| {
-                error!("Failed to get cur block as hash reader");
-                Error::NotFoundError
-            })?;
+            let blobs = self
+                .blobs
+                .as_mut()
+                .expect("BUG: external blob handle missing");
             let mut cursor = TrieFileNodeHashReader::new(&self.db, blobs, block_id);
             let res = TrieStorageConnection::<T>::inner_write_children_hashes(
                 &mut cursor,
@@ -2539,14 +2905,10 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
             self.bench.write_children_hashes_finish(start_time, false);
             res
         } else {
-            // tries stored in DB
             let start_time = self.bench.write_children_hashes_start();
             let mut cursor = TrieSqlCursor {
                 db: &self.db,
-                block_id: self.data.cur_block_id.ok_or_else(|| {
-                    error!("Failed to get cur block as hash reader");
-                    Error::NotFoundError
-                })?,
+                block_id,
             };
             let res = TrieStorageConnection::<T>::inner_write_children_hashes(
                 &mut cursor,
@@ -2633,10 +2995,15 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
             );
             return trie_sql::get_node_hash_bytes(&self.db, block_id, ptr);
         }
-        let node_hash = match self.blobs.as_mut() {
-            Some(blobs) => blobs.get_node_hash_bytes(&self.db, block_id, ptr),
-            None => trie_sql::get_node_hash_bytes(&self.db, block_id, ptr),
-        }?;
+        let node_hash = if self.block_uses_external_blobs(block_id)? {
+            let blobs = self
+                .blobs
+                .as_mut()
+                .expect("BUG: external blob handle missing");
+            blobs.get_node_hash_bytes(&self.db, block_id, ptr)?
+        } else {
+            trie_sql::get_node_hash_bytes(&self.db, block_id, ptr)?
+        };
         Ok(node_hash)
     }
 
@@ -2707,24 +3074,23 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
                     .map(|node| (node, TrieHash([0u8; TRIEHASH_ENCODED_SIZE])));
             }
         }
-        let (node_inst, node_hash) = match self.blobs.as_mut() {
-            Some(blobs) => {
-                if read_hash {
-                    blobs.read_node_type(&self.db, block_id, ptr)?
-                } else {
-                    blobs
-                        .read_node_type_nohash(&self.db, block_id, ptr)
-                        .map(|node| (node, TrieHash([0u8; TRIEHASH_ENCODED_SIZE])))?
-                }
+        let (node_inst, node_hash) = if self.block_uses_external_blobs(block_id)? {
+            let blobs = self
+                .blobs
+                .as_mut()
+                .expect("BUG: external blob handle missing");
+            if read_hash {
+                blobs.read_node_type(&self.db, block_id, ptr)?
+            } else {
+                blobs
+                    .read_node_type_nohash(&self.db, block_id, ptr)
+                    .map(|node| (node, TrieHash([0u8; TRIEHASH_ENCODED_SIZE])))?
             }
-            None => {
-                if read_hash {
-                    trie_sql::read_node_type(&self.db, block_id, ptr)?
-                } else {
-                    trie_sql::read_node_type_nohash(&self.db, block_id, ptr)
-                        .map(|node| (node, TrieHash([0u8; TRIEHASH_ENCODED_SIZE])))?
-                }
-            }
+        } else if read_hash {
+            trie_sql::read_node_type(&self.db, block_id, ptr)?
+        } else {
+            trie_sql::read_node_type_nohash(&self.db, block_id, ptr)
+                .map(|node| (node, TrieHash([0u8; TRIEHASH_ENCODED_SIZE])))?
         };
         Ok((node_inst, node_hash))
     }

@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::prelude::*;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
-use std::{fs, io};
+use std::{fs, io, mem};
 
 use clarity::vm::analysis::analysis_db::AnalysisDatabase;
 use clarity::vm::clarity::TransactionConnection;
@@ -2104,6 +2104,25 @@ impl StacksChainState {
 
         let clarity_instance = &mut self.clarity_state;
         Ok((chainstate_tx, clarity_instance))
+    }
+
+    /// Temporarily swap in an overlay MARF for read-only operations that need to
+    /// query the index without touching on-disk state.
+    pub fn with_overlay_index<F, R>(&mut self, f: F) -> Result<R, Error>
+    where
+        F: FnOnce(&mut StacksChainState) -> Result<R, Error>,
+    {
+        let overlay = StacksChainStateEphemeral::new(self)
+            .overlay_index()
+            .map_err(Error::DBError)?;
+        overlay.setup_overlay_views().map_err(Error::MARFError)?;
+        let original = mem::replace(&mut self.state_index, overlay);
+        let result = f(self);
+        let overlay = mem::replace(&mut self.state_index, original);
+        if let Err(e) = overlay.teardown_overlay_views() {
+            warn!("Failed to tear down overlay MARF views: {:?}", e);
+        }
+        result
     }
 
     // NOTE: used for testing in the stacks testnet code.
