@@ -70,10 +70,6 @@ build_stacks_inspect() {
     git pull
     ## build stacks-inspect to: ${REPO_DIR}/target/release/stacks-inspect
     echo "Building stacks-inspect binary"
-    cd contrib/stacks-inspect || {
-        echo "${COLRED}Error${COLRESET} changing directory to contrib/stacks-inspect"
-        exit 1
-    }
     cargo build --bin=stacks-inspect --release || {
         echo "${COLRED}Error${COLRESET} building stacks-inspect binary"
         exit 1
