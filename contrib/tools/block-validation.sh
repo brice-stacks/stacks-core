@@ -171,6 +171,7 @@ start_validation() {
     local log_append
     local inspect_command="validate-block"
     local config="${REPO_DIR}/stackslib/conf/${NETWORK}-follower-conf.toml"
+    local cmd_arg="index-range"
 
     case "$mode" in
         nakamoto)
@@ -179,23 +180,19 @@ start_validation() {
             local log_append="_${mode}"
             ## get the total number of nakamoto blocks in db
             total_blocks=$(echo "select count(*) from nakamoto_block_headers" | sqlite3 "${SLICE_DIR}"0/chainstate/vm/index.sqlite)
-            ## get the total number of pre-nakamoto blocks in db
-            pre_naka_blocks=$(echo "select max(height) from staging_blocks" | sqlite3 "${SLICE_DIR}"0/chainstate/vm/index.sqlite)
-            ## start nakamoto validation 1 block after the last pre-nakamoto block
-            starting_block=$(( pre_naka_blocks + 1 )) # for the block counter, start at this block
             ## use these values if `--testing` arg is provided (only validate 1_000 blocks)
+            cmd_arg="naka-index-range"
             ${TESTING} && total_blocks=301883
             ${TESTING} && starting_block=300883
             ;;
         *)
             ## pre-nakamoto blocks
             echo "Mode: ${COLYELLOW}pre-nakamoto${COLRESET}"
-            # local log_append=""
             ## get the total number of blocks (with orphans) in db
-            total_blocks=$(echo "select count(*) from staging_blocks" | sqlite3 "${SLICE_DIR}"0/chainstate/vm/index.sqlite)
-            ## use these values if `--testing` arg is provided (only validate 1_000 blocks) Note:  2.5 epoch is at 153106
-            ${TESTING} && total_blocks=146000
-            ${TESTING} && starting_block=147000
+            total_blocks=$(echo "select count(*) from staging_blocks where orphaned = 0" | sqlite3 "${SLICE_DIR}"0/chainstate/vm/index.sqlite)
+            ## use these values if `--testing` arg is provided (only validate 1_000 blocks)
+            ${TESTING} && total_blocks=162200
+            ${TESTING} && starting_block=161200
             ;;
     esac
     local block_diff=$((total_blocks - starting_block)) ## how many blocks are being validated
@@ -225,7 +222,7 @@ start_validation() {
         fi
         local log_file="${LOG_DIR}/slice${slice_counter}${log_append}.log"
         local log=" | tee -a ${log_file}"
-        local cmd="${REPO_DIR}/target/release/stacks-inspect --config ${config} ${inspect_command}  ${SLICE_DIR}${slice_counter} range $start_block_count $end_block_count 2>/dev/null"
+        local cmd="${REPO_DIR}/target/release/stacks-inspect --config ${config} ${inspect_command}  ${SLICE_DIR}${slice_counter} ${cmd_arg} $start_block_count $end_block_count 2>/dev/null"
         echo "  Creating tmux window: ${COLGREEN}${TMUX_SESSION}:slice${slice_counter}${COLRESET} :: Blocks: ${COLYELLOW}${start_block_count}-${end_block_count}${COLRESET} || Logging to: ${log_file}"
         echo "Command: ${cmd}" > "${log_file}" ## log the command being run for the slice
         echo "Validating indexed blocks: ${start_block_count}-${end_block_count} (out of ${total_blocks})" >> "${log_file}"
