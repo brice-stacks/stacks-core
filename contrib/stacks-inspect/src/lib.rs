@@ -879,7 +879,10 @@ pub fn command_contract_effects(argv: &[String], conf: Option<&Config>) {
             let contract_source =
                 clarity_tx.with_clarity_db_readonly(|db| db.get_contract_src(&contract_id));
             let Some(contract_source) = contract_source else {
-                return Ok::<Option<ContractAnalysis>, String>(None);
+                return Ok::<
+                    Option<(ContractAnalysis, BTreeMap<ClarityName, FunctionEffects>)>,
+                    String,
+                >(None);
             };
 
             let clarity_version = clarity_tx
@@ -910,6 +913,7 @@ pub fn command_contract_effects(argv: &[String], conf: Option<&Config>) {
             });
             let mut analysis = analysis_result
                 .map_err(|e| format!("Failed to analyze contract {contract_id}: {}", e.0))?;
+            let raw_effects = analysis.function_effects.clone();
             let mut contracts = collect_contract_effects_recursive(
                 clarity_tx,
                 &contract_id,
@@ -919,11 +923,11 @@ pub fn command_contract_effects(argv: &[String], conf: Option<&Config>) {
             if let Some(resolved) = contracts.get(&contract_id) {
                 analysis.function_effects = resolved.clone();
             }
-            Ok(Some(analysis))
+            Ok(Some((analysis, raw_effects)))
         });
 
-    let analysis = match analysis_result {
-        Ok(Some(Ok(Some(analysis)))) => analysis,
+    let (analysis, raw_effects) = match analysis_result {
+        Ok(Some(Ok(Some((analysis, raw_effects))))) => (analysis, raw_effects),
         Ok(Some(Ok(None))) => {
             eprintln!("Contract {contract_id} has no source in chainstate.");
             process::exit(1);
@@ -946,10 +950,25 @@ pub fn command_contract_effects(argv: &[String], conf: Option<&Config>) {
         for (name, effects) in analysis.function_effects.iter() {
             effects_map.insert(name.to_string(), function_effects_to_json(effects));
         }
+        let mut calls_map = serde_json::Map::new();
+        for (name, effects) in raw_effects.iter() {
+            let calls = effects
+                .contract_calls
+                .iter()
+                .map(|call| {
+                    json!({
+                        "contract": format_contract_reference(&call.contract),
+                        "function": call.function.to_string(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            calls_map.insert(name.to_string(), JsonValue::Array(calls));
+        }
         let value = json!({
             "contract": contract_id.to_string(),
             "clarity_version": format!("{:?}", analysis.clarity_version),
             "effects": effects_map,
+            "calls": calls_map,
         });
         println!("{}", serde_json::to_string_pretty(&value).unwrap());
         return;
@@ -1199,15 +1218,6 @@ fn analyze_tx_effects(
                 };
             };
 
-            let mut contracts =
-                collect_contract_effects_recursive(clarity_tx, &contract_id, effects_map)
-                    .unwrap_or_default();
-            let call_graph = if include_graph {
-                build_contract_call_graph(&contract_id, &call.function_name, &contracts)
-            } else {
-                Vec::new()
-            };
-
             let arg_contracts: Vec<Option<QualifiedContractIdentifier>> = call
                 .function_args
                 .iter()
@@ -1218,6 +1228,22 @@ fn analyze_tx_effects(
                 .iter()
                 .map(extract_principal_arg)
                 .collect();
+
+            let mut contracts =
+                collect_contract_effects_recursive(clarity_tx, &contract_id, effects_map)
+                    .unwrap_or_default();
+            let call_graph = if include_graph {
+                build_contract_call_graph(&contract_id, &call.function_name, &contracts)
+                    .into_iter()
+                    .map(|mut edge| {
+                        edge.to_contract =
+                            resolve_contract_reference(&edge.to_contract, &arg_contracts);
+                        edge
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
             let mut resolved = match resolve_contract_calls_across_contracts(
                 &root_effects,
@@ -1744,6 +1770,21 @@ fn resolve_principal_reference(
             .map(PrincipalReference::Literal)
             .unwrap_or(PrincipalReference::Any),
         other => other.clone(),
+    }
+}
+
+// Resolve a contract reference using transaction arguments.
+fn resolve_contract_reference(
+    reference: &ContractReference,
+    arg_contracts: &[Option<QualifiedContractIdentifier>],
+) -> ContractReference {
+    match reference {
+        ContractReference::Argument(index) => arg_contracts
+            .get(*index as usize)
+            .and_then(|value| value.clone())
+            .map(ContractReference::Literal)
+            .unwrap_or(ContractReference::Any),
+        _ => reference.clone(),
     }
 }
 
