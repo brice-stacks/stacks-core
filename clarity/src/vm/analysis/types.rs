@@ -47,8 +47,12 @@ pub trait AnalysisPass {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum PrincipalReference {
+    /// Dynamic principal that can't be resolved statically.
     Any,
+    /// Literal principal.
     Literal(PrincipalData),
+    /// Principal supplied via function argument index.
+    Argument(u32),
 }
 
 impl PartialOrd for PrincipalReference {
@@ -63,6 +67,11 @@ impl Ord for PrincipalReference {
             (PrincipalReference::Any, PrincipalReference::Any) => Ordering::Equal,
             (PrincipalReference::Any, _) => Ordering::Less,
             (_, PrincipalReference::Any) => Ordering::Greater,
+            (PrincipalReference::Argument(left), PrincipalReference::Argument(right)) => {
+                left.cmp(right)
+            }
+            (PrincipalReference::Argument(_), PrincipalReference::Literal(_)) => Ordering::Less,
+            (PrincipalReference::Literal(_), PrincipalReference::Argument(_)) => Ordering::Greater,
             (PrincipalReference::Literal(left), PrincipalReference::Literal(right)) => {
                 left.to_string().cmp(&right.to_string())
             }

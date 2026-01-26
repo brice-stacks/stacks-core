@@ -24,7 +24,7 @@ use crate::vm::analysis::types::{
     ContractStorageAccess, EffectTarget, FunctionEffects, PrincipalReference, Purity,
     StorageLocation, TokenKind,
 };
-use crate::vm::types::QualifiedContractIdentifier;
+use crate::vm::types::{PrincipalData, QualifiedContractIdentifier};
 
 #[test]
 fn test_effects_contract_call_argument_reference() {
@@ -221,6 +221,47 @@ fn test_effects_assets_stx() {
 }
 
 #[test]
+fn test_effects_principal_binding_resolution() {
+    let snippet = "(define-read-only (read-balance (p principal))
+  (let ((q p))
+    (stx-get-balance q)))
+";
+
+    let (_, analysis) =
+        mem_run_analysis(snippet, ClarityVersion::latest(), StacksEpochId::latest()).unwrap();
+    let expected = EffectTarget::AssetOwnership(AssetOwnershipAccess {
+        asset: AssetId::stx(),
+        principal: PrincipalReference::Argument(0),
+    });
+    let reads = analysis
+        .function_effects
+        .get("read-balance")
+        .expect("missing function effects for read-balance");
+    assert!(reads.reads.contains(&expected));
+}
+
+#[test]
+fn test_effects_principal_constant_resolution() {
+    let snippet = "(define-constant owner .callee)
+(define-read-only (read-balance)
+  (stx-get-balance owner))
+";
+
+    let (_, analysis) =
+        mem_run_analysis(snippet, ClarityVersion::latest(), StacksEpochId::latest()).unwrap();
+    let contract_id = QualifiedContractIdentifier::local("callee").unwrap();
+    let expected = EffectTarget::AssetOwnership(AssetOwnershipAccess {
+        asset: AssetId::stx(),
+        principal: PrincipalReference::Literal(PrincipalData::Contract(contract_id)),
+    });
+    let reads = analysis
+        .function_effects
+        .get("read-balance")
+        .expect("missing function effects for read-balance");
+    assert!(reads.reads.contains(&expected));
+}
+
+#[test]
 fn test_effects_assets_ft_nft() {
     let snippet = "(define-fungible-token token)
 (define-non-fungible-token collectible uint)
@@ -228,6 +269,7 @@ fn test_effects_assets_ft_nft() {
 (define-read-only (token-reads)
   (begin
     (ft-get-balance token tx-sender)
+    (ft-get-supply token)
     (nft-get-owner? collectible u1)
     u1))
 
@@ -319,6 +361,32 @@ fn test_effects_call_propagation_and_purity() {
 }
 
 #[test]
+fn test_effects_contract_call_propagation() {
+    let snippet = "(define-trait compute-trait ((compute () (response uint uint))))
+
+(define-private (inner (computer <compute-trait>))
+  (contract-call? computer compute))
+
+(define-public (outer (computer <compute-trait>))
+  (begin
+    (unwrap! (inner computer) (err u0))
+    (ok true)))
+";
+
+    let (_, analysis) =
+        mem_run_analysis(snippet, ClarityVersion::latest(), StacksEpochId::latest()).unwrap();
+    let expected = ContractCall {
+        contract: ContractReference::Argument(0),
+        function: "compute".into(),
+    };
+    let outer = analysis
+        .function_effects
+        .get("outer")
+        .expect("missing function effects for outer");
+    assert!(outer.contract_calls.contains(&expected));
+}
+
+#[test]
 fn test_effects_contract_call_resolution() {
     let contract_id = QualifiedContractIdentifier::local("callee").unwrap();
     let mut callee_effects = FunctionEffects::default();
@@ -338,6 +406,34 @@ fn test_effects_contract_call_resolution() {
     });
 
     let resolved = caller_effects.resolve_contract_calls(&[], &contracts);
+    assert!(
+        resolved
+            .reads
+            .contains(&EffectTarget::ChainState(ChainStateRead::StacksBlockInfo))
+    );
+    assert!(resolved.contract_calls.is_empty());
+}
+
+#[test]
+fn test_effects_contract_call_argument_resolution() {
+    let contract_id = QualifiedContractIdentifier::local("callee").unwrap();
+    let mut callee_effects = FunctionEffects::default();
+    callee_effects
+        .reads
+        .insert(EffectTarget::ChainState(ChainStateRead::StacksBlockInfo));
+
+    let mut callee_functions = BTreeMap::new();
+    callee_functions.insert("read".into(), callee_effects);
+    let mut contracts = BTreeMap::new();
+    contracts.insert(contract_id.clone(), callee_functions);
+
+    let mut caller_effects = FunctionEffects::default();
+    caller_effects.contract_calls.insert(ContractCall {
+        contract: ContractReference::Argument(0),
+        function: "read".into(),
+    });
+
+    let resolved = caller_effects.resolve_contract_calls(&[Some(contract_id)], &contracts);
     assert!(
         resolved
             .reads

@@ -46,6 +46,8 @@ pub struct EffectsAnalyzer {
     call_graph: BTreeMap<ClarityName, BTreeSet<ClarityName>>,
     /// Function names declared in this contract.
     known_functions: BTreeSet<ClarityName>,
+    /// Contract constants that resolve to literal/argument principals.
+    principal_constants: BTreeMap<ClarityName, PrincipalReference>,
 }
 
 struct FunctionInfo {
@@ -74,6 +76,7 @@ impl EffectsAnalyzer {
             function_effects: BTreeMap::new(),
             call_graph: BTreeMap::new(),
             known_functions: BTreeSet::new(),
+            principal_constants: BTreeMap::new(),
         }
     }
 
@@ -87,6 +90,13 @@ impl EffectsAnalyzer {
         for expr in contract_analysis.expressions.iter() {
             if let Some(define_expr) = DefineFunctionsParsed::try_parse(expr)? {
                 match define_expr {
+                    DefineFunctionsParsed::Constant { name, value } => {
+                        let reference =
+                            self.resolve_principal(value, &BTreeMap::new(), &BTreeMap::new());
+                        if reference != PrincipalReference::Any {
+                            self.principal_constants.insert(name.clone(), reference);
+                        }
+                    }
                     DefineFunctionsParsed::PrivateFunction { signature, body }
                     | DefineFunctionsParsed::ReadOnlyFunction { signature, body }
                     | DefineFunctionsParsed::PublicFunction { signature, body } => {
@@ -107,8 +117,7 @@ impl EffectsAnalyzer {
                             },
                         );
                     }
-                    DefineFunctionsParsed::Constant { .. }
-                    | DefineFunctionsParsed::NonFungibleToken { .. }
+                    DefineFunctionsParsed::NonFungibleToken { .. }
                     | DefineFunctionsParsed::BoundedFungibleToken { .. }
                     | DefineFunctionsParsed::UnboundedFungibleToken { .. }
                     | DefineFunctionsParsed::Map { .. }
@@ -130,6 +139,7 @@ impl EffectsAnalyzer {
                 &info.body,
                 &function_name,
                 &info.param_indices,
+                &BTreeMap::new(),
                 &mut function_effects,
             );
             self.function_effects
@@ -196,13 +206,20 @@ impl EffectsAnalyzer {
         expr: &SymbolicExpression,
         current_function: &ClarityName,
         param_indices: &BTreeMap<ClarityName, u32>,
+        bindings: &BTreeMap<ClarityName, PrincipalReference>,
         effects: &mut FunctionEffects,
     ) {
         // Walk the expression tree and aggregate direct effects.
         match &expr.expr {
             AtomValue(_) | LiteralValue(_) | Atom(_) | TraitReference(_, _) | Field(_) => {}
             List(expressions) => {
-                self.analyze_list(expressions, current_function, param_indices, effects);
+                self.analyze_list(
+                    expressions,
+                    current_function,
+                    param_indices,
+                    bindings,
+                    effects,
+                );
             }
         }
     }
@@ -212,6 +229,7 @@ impl EffectsAnalyzer {
         expressions: &[SymbolicExpression],
         current_function: &ClarityName,
         param_indices: &BTreeMap<ClarityName, u32>,
+        bindings: &BTreeMap<ClarityName, PrincipalReference>,
         effects: &mut FunctionEffects,
     ) {
         // Classify the head expression as native or user-defined call.
@@ -220,7 +238,7 @@ impl EffectsAnalyzer {
         };
         let Some(function_name) = function_name_expr.match_atom() else {
             for expr in expressions {
-                self.analyze_expr(expr, current_function, param_indices, effects);
+                self.analyze_expr(expr, current_function, param_indices, bindings, effects);
             }
             return;
         };
@@ -228,13 +246,17 @@ impl EffectsAnalyzer {
         if let Some(native_function) =
             NativeFunctions::lookup_by_name_at_version(function_name, &self.clarity_version)
         {
-            for arg in args {
-                self.analyze_expr(arg, current_function, param_indices, effects);
+            if native_function == NativeFunctions::Let {
+                self.analyze_let(args, current_function, param_indices, bindings, effects);
+                return;
             }
-            self.apply_native_effects(native_function, args, param_indices, effects);
+            for arg in args {
+                self.analyze_expr(arg, current_function, param_indices, bindings, effects);
+            }
+            self.apply_native_effects(native_function, args, param_indices, bindings, effects);
         } else {
             for arg in args {
-                self.analyze_expr(arg, current_function, param_indices, effects);
+                self.analyze_expr(arg, current_function, param_indices, bindings, effects);
             }
             if self.known_functions.contains(function_name) {
                 self.call_graph
@@ -250,6 +272,7 @@ impl EffectsAnalyzer {
         native_function: NativeFunctions,
         args: &[SymbolicExpression],
         param_indices: &BTreeMap<ClarityName, u32>,
+        bindings: &BTreeMap<ClarityName, PrincipalReference>,
         effects: &mut FunctionEffects,
     ) {
         // Map native functions to the corresponding effect category.
@@ -296,7 +319,10 @@ impl EffectsAnalyzer {
                     .insert(EffectTarget::ChainState(ChainStateRead::TenureInfo));
             }
             GetStxBalance | StxGetAccount => {
-                if let Some(principal) = args.first().map(Self::principal_reference) {
+                if let Some(principal) = args
+                    .first()
+                    .map(|expr| self.resolve_principal(expr, param_indices, bindings))
+                {
                     effects
                         .reads
                         .insert(EffectTarget::AssetOwnership(AssetOwnershipAccess {
@@ -306,8 +332,12 @@ impl EffectsAnalyzer {
                 }
             }
             StxTransfer | StxTransferMemo => {
-                let from = args.get(1).map(Self::principal_reference);
-                let to = args.get(2).map(Self::principal_reference);
+                let from = args
+                    .get(1)
+                    .map(|expr| self.resolve_principal(expr, param_indices, bindings));
+                let to = args
+                    .get(2)
+                    .map(|expr| self.resolve_principal(expr, param_indices, bindings));
                 for principal in [from, to].into_iter().flatten() {
                     let access = EffectTarget::AssetOwnership(AssetOwnershipAccess {
                         asset: AssetId::stx(),
@@ -318,7 +348,10 @@ impl EffectsAnalyzer {
                 }
             }
             StxBurn => {
-                if let Some(principal) = args.get(1).map(Self::principal_reference) {
+                if let Some(principal) = args
+                    .get(1)
+                    .map(|expr| self.resolve_principal(expr, param_indices, bindings))
+                {
                     let access = EffectTarget::AssetOwnership(AssetOwnershipAccess {
                         asset: AssetId::stx(),
                         principal,
@@ -331,7 +364,7 @@ impl EffectsAnalyzer {
                 if let (Some(token_name), Some(principal_expr)) = (args.first(), args.get(1))
                     && let Some(asset) = self.ft_asset(token_name)
                 {
-                    let principal = Self::principal_reference(principal_expr);
+                    let principal = self.resolve_principal(principal_expr, param_indices, bindings);
                     effects
                         .reads
                         .insert(EffectTarget::AssetOwnership(AssetOwnershipAccess {
@@ -354,8 +387,12 @@ impl EffectsAnalyzer {
             }
             TransferToken => {
                 if let Some(asset) = args.first().and_then(|name| self.ft_asset(name)) {
-                    let from = args.get(2).map(Self::principal_reference);
-                    let to = args.get(3).map(Self::principal_reference);
+                    let from = args
+                        .get(2)
+                        .map(|expr| self.resolve_principal(expr, param_indices, bindings));
+                    let to = args
+                        .get(3)
+                        .map(|expr| self.resolve_principal(expr, param_indices, bindings));
                     for principal in [from, to].into_iter().flatten() {
                         let access = EffectTarget::AssetOwnership(AssetOwnershipAccess {
                             asset: asset.clone(),
@@ -368,7 +405,9 @@ impl EffectsAnalyzer {
             }
             MintToken => {
                 if let Some(asset) = args.first().and_then(|name| self.ft_asset(name))
-                    && let Some(principal) = args.get(2).map(Self::principal_reference)
+                    && let Some(principal) = args
+                        .get(2)
+                        .map(|expr| self.resolve_principal(expr, param_indices, bindings))
                 {
                     let access =
                         EffectTarget::AssetOwnership(AssetOwnershipAccess { asset, principal });
@@ -377,7 +416,9 @@ impl EffectsAnalyzer {
             }
             BurnToken => {
                 if let Some(asset) = args.first().and_then(|name| self.ft_asset(name))
-                    && let Some(principal) = args.get(2).map(Self::principal_reference)
+                    && let Some(principal) = args
+                        .get(2)
+                        .map(|expr| self.resolve_principal(expr, param_indices, bindings))
                 {
                     let access =
                         EffectTarget::AssetOwnership(AssetOwnershipAccess { asset, principal });
@@ -397,8 +438,12 @@ impl EffectsAnalyzer {
             }
             TransferAsset => {
                 if let Some(asset) = args.first().and_then(|name| self.nft_asset(name)) {
-                    let from = args.get(2).map(Self::principal_reference);
-                    let to = args.get(3).map(Self::principal_reference);
+                    let from = args
+                        .get(2)
+                        .map(|expr| self.resolve_principal(expr, param_indices, bindings));
+                    let to = args
+                        .get(3)
+                        .map(|expr| self.resolve_principal(expr, param_indices, bindings));
                     for principal in [from, to].into_iter().flatten() {
                         let access = EffectTarget::AssetOwnership(AssetOwnershipAccess {
                             asset: asset.clone(),
@@ -411,7 +456,9 @@ impl EffectsAnalyzer {
             }
             MintAsset => {
                 if let Some(asset) = args.first().and_then(|name| self.nft_asset(name))
-                    && let Some(principal) = args.get(2).map(Self::principal_reference)
+                    && let Some(principal) = args
+                        .get(2)
+                        .map(|expr| self.resolve_principal(expr, param_indices, bindings))
                 {
                     let access =
                         EffectTarget::AssetOwnership(AssetOwnershipAccess { asset, principal });
@@ -420,7 +467,9 @@ impl EffectsAnalyzer {
             }
             BurnAsset => {
                 if let Some(asset) = args.first().and_then(|name| self.nft_asset(name))
-                    && let Some(principal) = args.get(2).map(Self::principal_reference)
+                    && let Some(principal) = args
+                        .get(2)
+                        .map(|expr| self.resolve_principal(expr, param_indices, bindings))
                 {
                     let access =
                         EffectTarget::AssetOwnership(AssetOwnershipAccess { asset, principal });
@@ -453,12 +502,28 @@ impl EffectsAnalyzer {
         }
     }
 
-    fn principal_reference(expr: &SymbolicExpression) -> PrincipalReference {
-        // Resolve literal principals, otherwise mark as unknown.
+    fn resolve_principal(
+        &self,
+        expr: &SymbolicExpression,
+        param_indices: &BTreeMap<ClarityName, u32>,
+        bindings: &BTreeMap<ClarityName, PrincipalReference>,
+    ) -> PrincipalReference {
+        // Resolve literal principals, parameters, let-bindings, and constants.
         match &expr.expr {
             SymbolicExpressionType::LiteralValue(Value::Principal(principal)) => {
                 PrincipalReference::Literal(principal.clone())
             }
+            SymbolicExpressionType::Atom(name) => bindings
+                .get(name)
+                .cloned()
+                .or_else(|| {
+                    param_indices
+                        .get(name)
+                        .copied()
+                        .map(PrincipalReference::Argument)
+                })
+                .or_else(|| self.principal_constants.get(name).cloned())
+                .unwrap_or(PrincipalReference::Any),
             _ => PrincipalReference::Any,
         }
     }
@@ -499,6 +564,48 @@ impl EffectsAnalyzer {
                 TokenKind::NonFungible,
             )
         })
+    }
+
+    fn analyze_let(
+        &mut self,
+        args: &[SymbolicExpression],
+        current_function: &ClarityName,
+        param_indices: &BTreeMap<ClarityName, u32>,
+        bindings: &BTreeMap<ClarityName, PrincipalReference>,
+        effects: &mut FunctionEffects,
+    ) {
+        // Evaluate bindings first, then analyze the let body with extended bindings.
+        let mut extended = bindings.clone();
+        let bindings_list = args
+            .first()
+            .and_then(|expr| expr.match_list())
+            .unwrap_or(&[]);
+        for binding in bindings_list {
+            let Some(pair) = binding.match_list() else {
+                continue;
+            };
+            let (Some(name), Some(value)) = (pair.first(), pair.get(1)) else {
+                continue;
+            };
+            let Some(binding_name) = name.match_atom() else {
+                continue;
+            };
+            self.analyze_expr(value, current_function, param_indices, bindings, effects);
+            let reference = self.resolve_principal(value, param_indices, &extended);
+            if reference != PrincipalReference::Any {
+                extended.insert(binding_name.clone(), reference);
+            }
+        }
+
+        for body_expr in args.iter().skip(1) {
+            self.analyze_expr(
+                body_expr,
+                current_function,
+                param_indices,
+                &extended,
+                effects,
+            );
+        }
     }
 
     fn extract_param_indices(signature: &[SymbolicExpression]) -> BTreeMap<ClarityName, u32> {
