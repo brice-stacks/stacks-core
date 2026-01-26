@@ -59,12 +59,12 @@ struct FunctionInfo {
 
 impl AnalysisPass for EffectsAnalyzer {
     fn run_pass(
-        _epoch: &StacksEpochId,
+        epoch: &StacksEpochId,
         contract_analysis: &mut ContractAnalysis,
-        _analysis_db: &mut AnalysisDatabase,
+        analysis_db: &mut AnalysisDatabase,
     ) -> Result<(), StaticCheckError> {
         let mut analyzer = EffectsAnalyzer::new(contract_analysis);
-        analyzer.run(contract_analysis)
+        analyzer.run(epoch, contract_analysis, analysis_db)
     }
 }
 
@@ -80,9 +80,115 @@ impl EffectsAnalyzer {
         }
     }
 
+    pub fn compute_deploy_effects(
+        contract_analysis: &ContractAnalysis,
+    ) -> Result<FunctionEffects, StaticCheckError> {
+        let mut analyzer = EffectsAnalyzer::new(contract_analysis);
+        analyzer.function_effects = contract_analysis.function_effects.clone();
+        analyzer.known_functions = analyzer.function_effects.keys().cloned().collect();
+
+        let mut deploy_effects = FunctionEffects::default();
+        let param_indices = BTreeMap::new();
+        let bindings = BTreeMap::new();
+        let deploy_name = ClarityName::from("deploy");
+
+        for expr in contract_analysis.expressions.iter() {
+            if let Some(define_expr) = DefineFunctionsParsed::try_parse(expr)?
+                && let DefineFunctionsParsed::Constant { name, value } = define_expr
+            {
+                let reference = analyzer.resolve_principal(value, &param_indices, &bindings);
+                if reference != PrincipalReference::Any {
+                    analyzer.principal_constants.insert(name.clone(), reference);
+                }
+            }
+        }
+
+        for expr in contract_analysis.expressions.iter() {
+            if let Some(define_expr) = DefineFunctionsParsed::try_parse(expr)? {
+                match define_expr {
+                    DefineFunctionsParsed::Constant { value, .. } => {
+                        analyzer.analyze_expr(
+                            value,
+                            &deploy_name,
+                            &param_indices,
+                            &bindings,
+                            &mut deploy_effects,
+                        );
+                    }
+                    DefineFunctionsParsed::PersistedVariable { name, initial, .. } => {
+                        deploy_effects.writes.insert(EffectTarget::Contract(
+                            ContractStorageAccess {
+                                contract: ContractReference::Literal(
+                                    analyzer.contract_identifier.clone(),
+                                ),
+                                location: Some(StorageLocation::DataVar(name.clone())),
+                            },
+                        ));
+                        analyzer.analyze_expr(
+                            initial,
+                            &deploy_name,
+                            &param_indices,
+                            &bindings,
+                            &mut deploy_effects,
+                        );
+                    }
+                    DefineFunctionsParsed::Map { name, .. } => {
+                        deploy_effects.writes.insert(EffectTarget::Contract(
+                            ContractStorageAccess {
+                                contract: ContractReference::Literal(
+                                    analyzer.contract_identifier.clone(),
+                                ),
+                                location: Some(StorageLocation::DataMap(name.clone())),
+                            },
+                        ));
+                    }
+                    DefineFunctionsParsed::BoundedFungibleToken { max_supply, .. } => {
+                        analyzer.analyze_expr(
+                            max_supply,
+                            &deploy_name,
+                            &param_indices,
+                            &bindings,
+                            &mut deploy_effects,
+                        );
+                    }
+                    _ => {}
+                }
+            } else {
+                analyzer.analyze_expr(
+                    expr,
+                    &deploy_name,
+                    &param_indices,
+                    &bindings,
+                    &mut deploy_effects,
+                );
+            }
+        }
+
+        analyzer
+            .function_effects
+            .insert(deploy_name.clone(), deploy_effects);
+        analyzer.known_functions.insert(deploy_name.clone());
+        analyzer.propagate_call_effects();
+        let mut deploy_effects = analyzer
+            .function_effects
+            .remove(&deploy_name)
+            .unwrap_or_default();
+        deploy_effects.purity = if deploy_effects.reads.is_empty()
+            && deploy_effects.writes.is_empty()
+            && deploy_effects.contract_calls.is_empty()
+        {
+            Purity::Pure
+        } else {
+            Purity::Impure
+        };
+        Ok(deploy_effects)
+    }
+
     pub fn run(
         &mut self,
+        epoch: &StacksEpochId,
         contract_analysis: &mut ContractAnalysis,
+        analysis_db: &mut AnalysisDatabase,
     ) -> Result<(), StaticCheckError> {
         // Collect function bodies and parameter indices for a single pass analysis.
         let mut function_bodies: BTreeMap<ClarityName, FunctionInfo> = BTreeMap::new();
@@ -148,10 +254,86 @@ impl EffectsAnalyzer {
 
         // Propagate effects across intra-contract calls.
         self.propagate_call_effects();
+        // Resolve contract-call effects using any available callee contract analyses.
+        self.resolve_contract_calls(epoch, analysis_db)?;
         // Derive purity from the final effect sets.
         self.update_purity();
         contract_analysis.function_effects = self.function_effects.clone();
         Ok(())
+    }
+
+    fn resolve_contract_calls(
+        &mut self,
+        epoch: &StacksEpochId,
+        analysis_db: &mut AnalysisDatabase,
+    ) -> Result<(), StaticCheckError> {
+        // Build a transitive closure of contract effects we can load, starting from this contract.
+        let contracts = self.load_contract_effects(epoch, analysis_db)?;
+        let mut resolved_effects = BTreeMap::new();
+        for (function, effects) in self.function_effects.iter() {
+            let mut resolved = effects.clone();
+            // Iteratively resolve contract calls until no further changes occur.
+            loop {
+                let next = resolved.resolve_contract_calls(&[], &contracts);
+                if next == resolved {
+                    break;
+                }
+                resolved = next;
+            }
+            resolved_effects.insert(function.clone(), resolved);
+        }
+        self.function_effects = resolved_effects;
+        Ok(())
+    }
+
+    fn load_contract_effects(
+        &self,
+        epoch: &StacksEpochId,
+        analysis_db: &mut AnalysisDatabase,
+    ) -> Result<
+        BTreeMap<QualifiedContractIdentifier, BTreeMap<ClarityName, FunctionEffects>>,
+        StaticCheckError,
+    > {
+        // Seed the map with this contract's effects, then recursively load callees.
+        let mut contracts = BTreeMap::new();
+        contracts.insert(
+            self.contract_identifier.clone(),
+            self.function_effects.clone(),
+        );
+        let mut queue = vec![self.contract_identifier.clone()];
+        let mut visited = BTreeSet::new();
+
+        while let Some(contract_id) = queue.pop() {
+            if !visited.insert(contract_id.clone()) {
+                continue;
+            }
+
+            let callees = contracts
+                .get(&contract_id)
+                .map(|functions| {
+                    functions
+                        .values()
+                        .flat_map(|effects| effects.contract_calls.iter())
+                        .filter_map(|call| match &call.contract {
+                            ContractReference::Literal(id) => Some(id.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            for callee in callees {
+                if contracts.contains_key(&callee) {
+                    continue;
+                }
+                if let Some(analysis) = analysis_db.load_contract(&callee, epoch)? {
+                    contracts.insert(callee.clone(), analysis.function_effects);
+                    queue.push(callee);
+                }
+            }
+        }
+
+        Ok(contracts)
     }
 
     fn update_purity(&mut self) {

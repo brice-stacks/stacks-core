@@ -21,8 +21,8 @@ use clarity::types::StacksEpochId;
 use clarity::types::chainstate::StacksPrivateKey;
 use clarity_cli::{DEFAULT_CLI_EPOCH, read_file_or_stdin, read_file_or_stdin_bytes};
 use stacks_inspect::{
-    command_contract_hash, command_replay_mock_mining, command_try_mine, command_validate_block,
-    drain_common_opts,
+    command_contract_effects, command_contract_hash, command_replay_mock_mining, command_try_mine,
+    command_tx_effects, command_txid_effects, command_validate_block, drain_common_opts,
 };
 use stackslib::chainstate::stacks::miner::BlockBuilderSettings;
 use stackslib::chainstate::stacks::{
@@ -1607,6 +1607,21 @@ check if the associated microblocks can be downloaded
 
     if argv[1] == "contract-hash" {
         command_contract_hash(&argv[1..], common_opts.config.as_ref());
+        process::exit(0);
+    }
+
+    if argv[1] == "contract-effects" {
+        command_contract_effects(&argv[1..], common_opts.config.as_ref());
+        process::exit(0);
+    }
+
+    if argv[1] == "tx-effects" {
+        command_tx_effects(&argv[1..], common_opts.config.as_ref());
+        process::exit(0);
+    }
+
+    if argv[1] == "txid-effects" {
+        command_txid_effects(&argv[1..], common_opts.config.as_ref());
         process::exit(0);
     }
 

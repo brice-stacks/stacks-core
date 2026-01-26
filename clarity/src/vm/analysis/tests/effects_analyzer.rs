@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use stacks_common::types::StacksEpochId;
 
 use crate::vm::ClarityVersion;
+use crate::vm::analysis::effects_analyzer::EffectsAnalyzer;
 use crate::vm::analysis::mem_type_check as mem_run_analysis;
 use crate::vm::analysis::types::{
     AssetId, AssetOwnershipAccess, ChainStateRead, ContractCall, ContractReference,
@@ -129,6 +130,52 @@ fn test_effects_map_and_var_access() {
             .writes
             .contains(&EffectTarget::Contract(ContractStorageAccess {
                 contract: contract.clone(),
+                location: Some(StorageLocation::DataMap("balances".into())),
+            }))
+    );
+}
+
+#[test]
+fn test_effects_deploy_top_level_expression() {
+    let snippet = "(define-data-var counter uint u0)
+(var-set counter u1)
+";
+
+    let (_, analysis) =
+        mem_run_analysis(snippet, ClarityVersion::latest(), StacksEpochId::latest()).unwrap();
+    let deploy_effects = EffectsAnalyzer::compute_deploy_effects(&analysis)
+        .expect("deploy effects should analyze top-level expressions");
+    let expected = EffectTarget::Contract(ContractStorageAccess {
+        contract: ContractReference::Literal(analysis.contract_identifier.clone()),
+        location: Some(StorageLocation::DataVar("counter".into())),
+    });
+    assert!(deploy_effects.writes.contains(&expected));
+}
+
+#[test]
+fn test_effects_deploy_definitions_are_writes() {
+    let snippet = "(define-data-var counter uint u0)
+(define-map balances { owner: principal } { amount: uint })
+";
+
+    let (_, analysis) =
+        mem_run_analysis(snippet, ClarityVersion::latest(), StacksEpochId::latest()).unwrap();
+    let deploy_effects = EffectsAnalyzer::compute_deploy_effects(&analysis)
+        .expect("deploy effects should include definition writes");
+    let contract = ContractReference::Literal(analysis.contract_identifier.clone());
+    assert!(
+        deploy_effects
+            .writes
+            .contains(&EffectTarget::Contract(ContractStorageAccess {
+                contract: contract.clone(),
+                location: Some(StorageLocation::DataVar("counter".into())),
+            }))
+    );
+    assert!(
+        deploy_effects
+            .writes
+            .contains(&EffectTarget::Contract(ContractStorageAccess {
+                contract,
                 location: Some(StorageLocation::DataMap("balances".into())),
             }))
     );

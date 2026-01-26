@@ -13,22 +13,37 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::io::Write;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use std::{fs, io, process};
 
 use clarity::types::chainstate::SortitionId;
 use clarity::util::hash::{Sha512Trunc256Sum, to_hex};
+use clarity::vm::analysis::effects_analyzer::EffectsAnalyzer;
+use clarity::vm::analysis::run_analysis;
+use clarity::vm::analysis::types::{
+    AccountNonceAccess, AssetId, AssetOwnershipAccess, ChainStateRead, ContractAnalysis,
+    ContractCall, ContractReference, EffectTarget, FunctionEffects, PrincipalReference, Purity,
+    StorageLocation, TokenKind,
+};
+use clarity::vm::ast::build_ast;
+use clarity::vm::clarity::ClarityConnection;
+use clarity::vm::costs::LimitedCostTracker;
+use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier, Value};
+use clarity::vm::{ClarityName, ClarityVersion};
 use clarity_cli::read_file_or_stdin;
 use regex::Regex;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use serde_json::{Value as JsonValue, json};
+use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId};
 use stacks_common::types::sqlite::NO_PARAMS;
-use stacks_common::util::hash::Hash160;
+use stacks_common::util::hash::{Hash160, hex_bytes};
 use stacks_common::util::vrf::VRFProof;
 use stacks_common::{debug, info, warn};
-use stackslib::burnchains::Burnchain;
+use stackslib::burnchains::{Burnchain, Txid};
 use stackslib::chainstate::burn::ConsensusHash;
 use stackslib::chainstate::burn::db::sortdb::{
     SortitionDB, SortitionHandleContext, get_ancestor_sort_id,
@@ -40,11 +55,11 @@ use stackslib::chainstate::nakamoto::miner::{
 use stackslib::chainstate::nakamoto::{NakamotoBlock, NakamotoChainState};
 use stackslib::chainstate::stacks::db::blocks::DummyEventDispatcher;
 use stackslib::chainstate::stacks::db::{
-    ChainstateTx, StacksBlockHeaderTypes, StacksChainState, StacksHeaderInfo,
+    ChainStateBootData, ChainstateTx, StacksBlockHeaderTypes, StacksChainState, StacksHeaderInfo,
 };
 use stackslib::chainstate::stacks::miner::*;
 use stackslib::chainstate::stacks::{Error as ChainstateError, *};
-use stackslib::clarity_vm::clarity::ClarityInstance;
+use stackslib::clarity_vm::clarity::{ClarityInstance, ClarityReadOnlyConnection};
 use stackslib::clarity_vm::database::GetTenureStartId;
 use stackslib::config::{Config, ConfigFile, DEFAULT_MAINNET_CONFIG};
 use stackslib::core::*;
@@ -117,7 +132,7 @@ pub fn drain_common_opts(argv: &mut Vec<String>, start_at: usize) -> CommonOpts 
     opts
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, Copy)]
 enum BlockSource {
     Nakamoto,
     Epoch2,
@@ -790,6 +805,1411 @@ pub fn command_contract_hash(argv: &[String], _conf: Option<&Config>) {
         contract_path
     };
     println!("Contract hash for {source_name}:\n{hex_string}");
+}
+
+/// Analyze a contract in chainstate and print effect summaries.
+///
+/// Arguments:
+///  - `argv`: Args in CLI format: `<command-name> [args...]`
+pub fn command_contract_effects(argv: &[String], conf: Option<&Config>) {
+    let print_help_and_exit = || -> ! {
+        let n = &argv[0];
+        eprintln!("Usage:");
+        eprintln!("  {n} <database-path> <contract-identifier> [--json]");
+        eprintln!();
+        eprintln!("Example:");
+        eprintln!("  {n} /tmp/chainstate SP3FBR2AGK8T3A1P84G0A1AD0H3Z2J9Y0T7H9VGRB.example --json");
+        process::exit(1);
+    };
+
+    let mut args = argv.to_vec();
+    let json_output = if let Some(pos) = args.iter().position(|arg| arg == "--json") {
+        args.remove(pos);
+        true
+    } else {
+        false
+    };
+
+    let db_path = args.get(1).unwrap_or_else(|| print_help_and_exit());
+    let contract_str = args.get(2).unwrap_or_else(|| print_help_and_exit());
+    let contract_id = match PrincipalData::parse_qualified_contract_principal(contract_str)
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to parse contract identifier '{contract_str}': {e}");
+            process::exit(1);
+        }) {
+        PrincipalData::Contract(contract_id) => contract_id,
+        _ => {
+            eprintln!("Expected a contract principal, got '{contract_str}'");
+            process::exit(1);
+        }
+    };
+
+    let conf = conf.unwrap_or(&DEFAULT_MAINNET_CONFIG);
+    let data_root = db_path.to_string();
+    let chain_state_path = format!("{data_root}/chainstate/");
+    let sort_db_path = format!("{data_root}/burnchain/sortition");
+    if !Path::new(&chain_state_path).exists() || !Path::new(&sort_db_path).exists() {
+        eprintln!("Chainstate not found at {chain_state_path} (or sortition at {sort_db_path}).");
+        process::exit(1);
+    }
+
+    let burnchain = conf.get_burnchain();
+    let mut boot_data = ChainStateBootData::new(&burnchain, vec![], None);
+    let (mut chainstate, _) = StacksChainState::open_and_exec(
+        conf.is_mainnet(),
+        conf.burnchain.chain_id,
+        &chain_state_path,
+        Some(&mut boot_data),
+        None,
+    )
+    .unwrap_or_else(|e| panic!("Failed to open chainstate at {chain_state_path}: {e:?}"));
+    let sort_db = SortitionDB::open(&sort_db_path, false, burnchain.pox_constants.clone())
+        .unwrap_or_else(|e| panic!("Failed to open sortition DB at {sort_db_path}: {e:?}"));
+    let chain_tip = SortitionDB::get_canonical_burn_chain_tip(sort_db.conn())
+        .unwrap_or_else(|e| panic!("Failed to get sortition chain tip: {e}"));
+    let burn_dbconn = sort_db.index_handle(&chain_tip.sortition_id);
+
+    let parent_header = NakamotoChainState::get_canonical_block_header(chainstate.db(), &sort_db)
+        .unwrap_or_else(|e| panic!("Failed to get chain tip: {e}"))
+        .expect("No chain tip found");
+    let stacks_tip = parent_header.index_block_hash();
+
+    let analysis_result =
+        chainstate.maybe_read_only_clarity_tx(&burn_dbconn, &stacks_tip, |clarity_tx| {
+            let contract_source =
+                clarity_tx.with_clarity_db_readonly(|db| db.get_contract_src(&contract_id));
+            let Some(contract_source) = contract_source else {
+                return Ok::<Option<ContractAnalysis>, String>(None);
+            };
+
+            let clarity_version = clarity_tx
+                .with_analysis_db_readonly(|db| db.get_clarity_version(&contract_id).ok())
+                .unwrap_or_else(|| ClarityVersion::default_for_epoch(clarity_tx.get_epoch()));
+
+            let epoch = clarity_tx.get_epoch();
+            let mut cost_track = LimitedCostTracker::new_free();
+            let contract_ast = build_ast(
+                &contract_id,
+                &contract_source,
+                &mut cost_track,
+                clarity_version,
+                epoch,
+            )
+            .map_err(|e| format!("Failed to parse contract {contract_id}: {e}"))?;
+            let analysis_result = clarity_tx.with_analysis_db_readonly(|db| {
+                run_analysis(
+                    &contract_id,
+                    &contract_ast.expressions,
+                    db,
+                    false,
+                    cost_track,
+                    epoch,
+                    clarity_version,
+                    false,
+                )
+            });
+            let mut analysis = analysis_result
+                .map_err(|e| format!("Failed to analyze contract {contract_id}: {}", e.0))?;
+            let mut contracts = collect_contract_effects_recursive(
+                clarity_tx,
+                &contract_id,
+                &analysis.function_effects,
+            )?;
+            resolve_contract_effects_transitively(&mut contracts);
+            if let Some(resolved) = contracts.get(&contract_id) {
+                analysis.function_effects = resolved.clone();
+            }
+            Ok(Some(analysis))
+        });
+
+    let analysis = match analysis_result {
+        Ok(Some(Ok(Some(analysis)))) => analysis,
+        Ok(Some(Ok(None))) => {
+            eprintln!("Contract {contract_id} has no source in chainstate.");
+            process::exit(1);
+        }
+        Ok(Some(Err(e))) => {
+            eprintln!("Failed to analyze contract {contract_id}: {e}");
+            process::exit(1);
+        }
+        Ok(None) => {
+            eprintln!("Contract {contract_id} not found in chainstate.");
+            process::exit(1);
+        }
+        Err(e) => {
+            panic!("Failed to read contract from chainstate: {e:?}");
+        }
+    };
+
+    if json_output {
+        let mut effects_map = serde_json::Map::new();
+        for (name, effects) in analysis.function_effects.iter() {
+            effects_map.insert(name.to_string(), function_effects_to_json(effects));
+        }
+        let value = json!({
+            "contract": contract_id.to_string(),
+            "clarity_version": format!("{:?}", analysis.clarity_version),
+            "effects": effects_map,
+        });
+        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        return;
+    }
+
+    println!("Contract: {contract_id}");
+    println!("Clarity version: {:?}", analysis.clarity_version);
+    for (name, effects) in analysis.function_effects.iter() {
+        println!();
+        println!("Function {name} ({:?})", effects.purity);
+        print_effects_section("reads", &effects.reads);
+        print_effects_section("writes", &effects.writes);
+        if !effects.contract_calls.is_empty() {
+            println!("  contract-calls:");
+            for call in effects.contract_calls.iter() {
+                println!(
+                    "    - {}.{}",
+                    format_contract_reference(&call.contract),
+                    call.function
+                );
+            }
+        }
+    }
+}
+
+/// Analyze a transaction from raw hex and print effect summaries.
+///
+/// Arguments:
+///  - `argv`: Args in CLI format: `<command-name> [args...]`
+pub fn command_tx_effects(argv: &[String], conf: Option<&Config>) {
+    let print_help_and_exit = || -> ! {
+        let n = &argv[0];
+        eprintln!("Usage:");
+        eprintln!("  {n} <database-path> <tx-hex|@file|-> [--json] [--graph]");
+        eprintln!();
+        eprintln!("Examples:");
+        eprintln!("  {n} /tmp/chainstate 00deadbeef");
+        eprintln!("  {n} /tmp/chainstate @/tmp/tx.hex --graph");
+        process::exit(1);
+    };
+
+    let mut args = argv.to_vec();
+    let json_output = if let Some(pos) = args.iter().position(|arg| arg == "--json") {
+        args.remove(pos);
+        true
+    } else {
+        false
+    };
+    let show_graph = if let Some(pos) = args.iter().position(|arg| arg == "--graph") {
+        args.remove(pos);
+        true
+    } else {
+        false
+    };
+
+    let db_path = args.get(1).unwrap_or_else(|| print_help_and_exit());
+    let tx_arg = args.get(2).unwrap_or_else(|| print_help_and_exit());
+    let tx_hex = read_hex_arg(tx_arg).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        process::exit(1);
+    });
+    let tx = parse_tx_from_hex(&tx_hex).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        process::exit(1);
+    });
+
+    let report =
+        analyze_tx_effects_with_chainstate(db_path, &tx, conf, show_graph).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            process::exit(1);
+        });
+    print_tx_effects_report(&report, json_output, show_graph);
+}
+
+/// Analyze a transaction by txid from chainstate and print effect summaries.
+///
+/// Arguments:
+///  - `argv`: Args in CLI format: `<command-name> [args...]`
+pub fn command_txid_effects(argv: &[String], conf: Option<&Config>) {
+    let print_help_and_exit = || -> ! {
+        let n = &argv[0];
+        eprintln!("Usage:");
+        eprintln!(
+            "  {n} <database-path> <txid-hex> [--block-id <index-block-hash>] [--json] [--graph]"
+        );
+        process::exit(1);
+    };
+
+    let mut args = argv.to_vec();
+    let block_id = if let Some(pos) = args.iter().position(|arg| arg == "--block-id") {
+        let block_hex = args.get(pos + 1).unwrap_or_else(|| print_help_and_exit());
+        let block_id = parse_block_id_hex(block_hex).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            process::exit(1);
+        });
+        args.drain(pos..=pos + 1);
+        Some(block_id)
+    } else {
+        None
+    };
+    let json_output = if let Some(pos) = args.iter().position(|arg| arg == "--json") {
+        args.remove(pos);
+        true
+    } else {
+        false
+    };
+    let show_graph = if let Some(pos) = args.iter().position(|arg| arg == "--graph") {
+        args.remove(pos);
+        true
+    } else {
+        false
+    };
+
+    let db_path = args.get(1).unwrap_or_else(|| print_help_and_exit());
+    let txid_hex = args.get(2).unwrap_or_else(|| print_help_and_exit());
+    let txid = parse_txid_hex(txid_hex).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        process::exit(1);
+    });
+
+    let (tx, index_block_hash) = load_tx_from_chainstate(db_path, &txid, block_id.as_ref(), conf)
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            process::exit(1);
+        });
+    let report =
+        analyze_tx_effects_with_chainstate(db_path, &tx, conf, show_graph).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            process::exit(1);
+        });
+    print_txid_effects_report(&report, &index_block_hash, json_output, show_graph);
+}
+
+#[derive(Debug)]
+struct CallGraphEdge {
+    from_contract: QualifiedContractIdentifier,
+    from_function: ClarityName,
+    to_contract: ContractReference,
+    to_function: ClarityName,
+    certainty: &'static str,
+}
+
+#[derive(Debug)]
+struct TxEffectsReport {
+    txid: Txid,
+    label: String,
+    effects: Option<FunctionEffects>,
+    unresolved_contract_calls: usize,
+    note: Option<String>,
+    call_graph: Vec<CallGraphEdge>,
+}
+
+fn analyze_tx_effects_with_chainstate(
+    db_path: &str,
+    tx: &StacksTransaction,
+    conf: Option<&Config>,
+    include_graph: bool,
+) -> Result<TxEffectsReport, String> {
+    let conf = conf.unwrap_or(&DEFAULT_MAINNET_CONFIG);
+    let data_root = db_path.to_string();
+    let chain_state_path = format!("{data_root}/chainstate/");
+    let sort_db_path = format!("{data_root}/burnchain/sortition");
+    if !Path::new(&chain_state_path).exists() || !Path::new(&sort_db_path).exists() {
+        return Err(format!(
+            "Chainstate not found at {chain_state_path} (or sortition at {sort_db_path})."
+        ));
+    }
+
+    let burnchain = conf.get_burnchain();
+    let mut boot_data = ChainStateBootData::new(&burnchain, vec![], None);
+    let (mut chainstate, _) = StacksChainState::open_and_exec(
+        conf.is_mainnet(),
+        conf.burnchain.chain_id,
+        &chain_state_path,
+        Some(&mut boot_data),
+        None,
+    )
+    .map_err(|e| format!("Failed to open chainstate at {chain_state_path}: {e:?}"))?;
+    let sort_db = SortitionDB::open(&sort_db_path, false, burnchain.pox_constants.clone())
+        .map_err(|e| format!("Failed to open sortition DB at {sort_db_path}: {e:?}"))?;
+
+    let chain_tip = SortitionDB::get_canonical_burn_chain_tip(sort_db.conn())
+        .map_err(|e| format!("Failed to get sortition chain tip: {e}"))?;
+    let burn_dbconn = sort_db.index_handle(&chain_tip.sortition_id);
+    let parent_header = NakamotoChainState::get_canonical_block_header(chainstate.db(), &sort_db)
+        .map_err(|e| format!("Failed to get chain tip: {e}"))?
+        .ok_or_else(|| "No chain tip found".to_string())?;
+    let stacks_tip = parent_header.index_block_hash();
+
+    let analysis_result = chainstate
+        .maybe_read_only_clarity_tx(&burn_dbconn, &stacks_tip, |clarity_tx| {
+            analyze_tx_effects(clarity_tx, tx, include_graph)
+        })
+        .map_err(|e| format!("Failed to read chainstate: {e:?}"))?;
+
+    analysis_result.ok_or_else(|| "Chain tip not found in chainstate.".to_string())
+}
+
+fn analyze_tx_effects(
+    clarity_tx: &mut ClarityReadOnlyConnection,
+    tx: &StacksTransaction,
+    include_graph: bool,
+) -> TxEffectsReport {
+    let txid = tx.txid();
+    let label = tx_label(tx);
+    let mut contract_effects: BTreeMap<
+        QualifiedContractIdentifier,
+        BTreeMap<ClarityName, FunctionEffects>,
+    > = BTreeMap::new();
+
+    match &tx.payload {
+        TransactionPayload::ContractCall(call) => {
+            let contract_id = call.contract_identifier();
+            let effects_map =
+                match load_contract_effects(clarity_tx, &contract_id, &mut contract_effects) {
+                    Ok(Some(())) => contract_effects.get(&contract_id),
+                    Ok(None) => None,
+                    Err(err) => {
+                        return TxEffectsReport {
+                            txid,
+                            label,
+                            effects: None,
+                            unresolved_contract_calls: 0,
+                            note: Some(err),
+                            call_graph: Vec::new(),
+                        };
+                    }
+                };
+            let Some(effects_map) = effects_map else {
+                return TxEffectsReport {
+                    txid,
+                    label,
+                    effects: None,
+                    unresolved_contract_calls: 0,
+                    note: Some("missing contract source".to_string()),
+                    call_graph: Vec::new(),
+                };
+            };
+            let Some(root_effects) = effects_map.get(&call.function_name).cloned() else {
+                return TxEffectsReport {
+                    txid,
+                    label,
+                    effects: None,
+                    unresolved_contract_calls: 0,
+                    note: Some("missing function analysis".to_string()),
+                    call_graph: Vec::new(),
+                };
+            };
+
+            let mut contracts =
+                collect_contract_effects_recursive(clarity_tx, &contract_id, effects_map)
+                    .unwrap_or_default();
+            let call_graph = if include_graph {
+                build_contract_call_graph(&contract_id, &call.function_name, &contracts)
+            } else {
+                Vec::new()
+            };
+
+            let arg_contracts: Vec<Option<QualifiedContractIdentifier>> = call
+                .function_args
+                .iter()
+                .map(extract_contract_arg)
+                .collect();
+            let arg_principals: Vec<Option<PrincipalData>> = call
+                .function_args
+                .iter()
+                .map(extract_principal_arg)
+                .collect();
+
+            let mut resolved = match resolve_contract_calls_across_contracts(
+                &root_effects,
+                &arg_contracts,
+                &mut contracts,
+                clarity_tx,
+            ) {
+                Ok(value) => value,
+                Err(err) => {
+                    return TxEffectsReport {
+                        txid,
+                        label,
+                        effects: None,
+                        unresolved_contract_calls: 0,
+                        note: Some(err),
+                        call_graph,
+                    };
+                }
+            };
+            resolved = resolve_principal_effects(&resolved, &arg_principals);
+            apply_tx_prereqs(&mut resolved, tx);
+
+            let unresolved = resolved.contract_calls.len();
+            TxEffectsReport {
+                txid,
+                label,
+                effects: Some(resolved),
+                unresolved_contract_calls: unresolved,
+                note: None,
+                call_graph,
+            }
+        }
+        TransactionPayload::SmartContract(contract, clarity_version_opt) => {
+            let Some(contract_id) = contract_deploy_identifier(tx, contract) else {
+                return TxEffectsReport {
+                    txid,
+                    label,
+                    effects: None,
+                    unresolved_contract_calls: 0,
+                    note: Some("missing origin principal".to_string()),
+                    call_graph: Vec::new(),
+                };
+            };
+            let epoch = clarity_tx.get_epoch();
+            let clarity_version =
+                (*clarity_version_opt).unwrap_or_else(|| ClarityVersion::default_for_epoch(epoch));
+            let contract_source = contract.code_body.to_string();
+            let mut cost_track = LimitedCostTracker::new_free();
+            let contract_ast = match build_ast(
+                &contract_id,
+                &contract_source,
+                &mut cost_track,
+                clarity_version,
+                epoch,
+            ) {
+                Ok(value) => value,
+                Err(err) => {
+                    return TxEffectsReport {
+                        txid,
+                        label,
+                        effects: None,
+                        unresolved_contract_calls: 0,
+                        note: Some(format!("Failed to parse contract: {err}")),
+                        call_graph: Vec::new(),
+                    };
+                }
+            };
+            let analysis_result = clarity_tx.with_analysis_db_readonly(|db| {
+                run_analysis(
+                    &contract_id,
+                    &contract_ast.expressions,
+                    db,
+                    false,
+                    cost_track,
+                    epoch,
+                    clarity_version,
+                    false,
+                )
+            });
+            let analysis = match analysis_result {
+                Ok(value) => value,
+                Err(err) => {
+                    return TxEffectsReport {
+                        txid,
+                        label,
+                        effects: None,
+                        unresolved_contract_calls: 0,
+                        note: Some(format!("Failed to analyze contract: {}", err.0)),
+                        call_graph: Vec::new(),
+                    };
+                }
+            };
+            let deploy_effects = match EffectsAnalyzer::compute_deploy_effects(&analysis) {
+                Ok(value) => value,
+                Err(err) => {
+                    return TxEffectsReport {
+                        txid,
+                        label,
+                        effects: None,
+                        unresolved_contract_calls: 0,
+                        note: Some(format!("Failed to analyze deploy effects: {err}")),
+                        call_graph: Vec::new(),
+                    };
+                }
+            };
+
+            let deploy_name = ClarityName::from("deploy");
+            let mut root_effects = BTreeMap::new();
+            root_effects.insert(deploy_name.clone(), deploy_effects.clone());
+            let mut contracts =
+                collect_contract_effects_recursive(clarity_tx, &contract_id, &root_effects)
+                    .unwrap_or_default();
+            let call_graph = if include_graph {
+                build_contract_call_graph(&contract_id, &deploy_name, &contracts)
+            } else {
+                Vec::new()
+            };
+
+            let mut resolved = match resolve_contract_calls_across_contracts(
+                &deploy_effects,
+                &[],
+                &mut contracts,
+                clarity_tx,
+            ) {
+                Ok(value) => value,
+                Err(err) => {
+                    return TxEffectsReport {
+                        txid,
+                        label,
+                        effects: None,
+                        unresolved_contract_calls: 0,
+                        note: Some(err),
+                        call_graph,
+                    };
+                }
+            };
+            apply_tx_prereqs(&mut resolved, tx);
+            let unresolved = resolved.contract_calls.len();
+            TxEffectsReport {
+                txid,
+                label,
+                effects: Some(resolved),
+                unresolved_contract_calls: unresolved,
+                note: None,
+                call_graph,
+            }
+        }
+        TransactionPayload::TokenTransfer(recipient, ..) => {
+            let mut effects = stx_transfer_effects(tx, recipient);
+            apply_tx_prereqs(&mut effects, tx);
+            TxEffectsReport {
+                txid,
+                label,
+                effects: Some(effects),
+                unresolved_contract_calls: 0,
+                note: None,
+                call_graph: Vec::new(),
+            }
+        }
+        TransactionPayload::Coinbase(_payload, recipient_opt, _vrf_opt) => {
+            let mut effects = coinbase_effects(tx, recipient_opt.as_ref());
+            apply_tx_prereqs(&mut effects, tx);
+            TxEffectsReport {
+                txid,
+                label,
+                effects: Some(effects),
+                unresolved_contract_calls: 0,
+                note: None,
+                call_graph: Vec::new(),
+            }
+        }
+        TransactionPayload::TenureChange(_payload) => {
+            let mut effects = tenure_change_effects();
+            apply_tx_prereqs(&mut effects, tx);
+            TxEffectsReport {
+                txid,
+                label,
+                effects: Some(effects),
+                unresolved_contract_calls: 0,
+                note: None,
+                call_graph: Vec::new(),
+            }
+        }
+        _ => TxEffectsReport {
+            txid,
+            label,
+            effects: None,
+            unresolved_contract_calls: 0,
+            note: Some("unsupported payload".to_string()),
+            call_graph: Vec::new(),
+        },
+    }
+}
+
+fn build_contract_call_graph(
+    root_contract: &QualifiedContractIdentifier,
+    root_function: &ClarityName,
+    contracts: &BTreeMap<QualifiedContractIdentifier, BTreeMap<ClarityName, FunctionEffects>>,
+) -> Vec<CallGraphEdge> {
+    let mut edges = Vec::new();
+    let mut visited = BTreeSet::new();
+    let mut queue = vec![(root_contract.clone(), root_function.clone())];
+
+    while let Some((contract_id, function_name)) = queue.pop() {
+        if !visited.insert((contract_id.clone(), function_name.clone())) {
+            continue;
+        }
+        let Some(functions) = contracts.get(&contract_id) else {
+            continue;
+        };
+        let Some(effects) = functions.get(&function_name) else {
+            continue;
+        };
+        for call in effects.contract_calls.iter() {
+            edges.push(CallGraphEdge {
+                from_contract: contract_id.clone(),
+                from_function: function_name.clone(),
+                to_contract: call.contract.clone(),
+                to_function: call.function.clone(),
+                certainty: "might",
+            });
+            if let ContractReference::Literal(callee_contract) = &call.contract {
+                queue.push((callee_contract.clone(), call.function.clone()));
+            }
+        }
+    }
+
+    edges
+}
+
+fn print_tx_effects_report(report: &TxEffectsReport, json_output: bool, show_graph: bool) {
+    if json_output {
+        let call_graph = report
+            .call_graph
+            .iter()
+            .map(|edge| {
+                json!({
+                    "from_contract": edge.from_contract.to_string(),
+                    "from_function": edge.from_function.to_string(),
+                    "to_contract": format_contract_reference(&edge.to_contract),
+                    "to_function": edge.to_function.to_string(),
+                    "certainty": edge.certainty,
+                })
+            })
+            .collect::<Vec<_>>();
+        let effects = report
+            .effects
+            .as_ref()
+            .map(function_effects_to_json)
+            .unwrap_or(JsonValue::Null);
+        let payload = json!({
+            "txid": report.txid.to_hex(),
+            "label": report.label,
+            "effects": effects,
+            "unresolved_contract_calls": report.unresolved_contract_calls,
+            "note": report.note,
+            "call_graph": call_graph,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload).unwrap());
+        return;
+    }
+
+    println!("Txid: {}", report.txid.to_hex());
+    println!("Type: {}", report.label);
+    if let Some(note) = &report.note {
+        println!("Note: {note}");
+    }
+    if let Some(effects) = &report.effects {
+        print_effects_section("reads", &effects.reads);
+        print_effects_section("writes", &effects.writes);
+        if report.unresolved_contract_calls > 0 {
+            println!(
+                "  unresolved contract calls: {}",
+                report.unresolved_contract_calls
+            );
+        }
+    }
+    if show_graph && !report.call_graph.is_empty() {
+        println!("  call-graph (might-call):");
+        for edge in report.call_graph.iter() {
+            println!(
+                "    - {}.{} -> {}.{}",
+                edge.from_contract,
+                edge.from_function,
+                format_contract_reference(&edge.to_contract),
+                edge.to_function
+            );
+        }
+    }
+}
+
+fn print_txid_effects_report(
+    report: &TxEffectsReport,
+    index_block_hash: &str,
+    json_output: bool,
+    show_graph: bool,
+) {
+    if json_output {
+        let call_graph = report
+            .call_graph
+            .iter()
+            .map(|edge| {
+                json!({
+                    "from_contract": edge.from_contract.to_string(),
+                    "from_function": edge.from_function.to_string(),
+                    "to_contract": format_contract_reference(&edge.to_contract),
+                    "to_function": edge.to_function.to_string(),
+                    "certainty": edge.certainty,
+                })
+            })
+            .collect::<Vec<_>>();
+        let effects = report
+            .effects
+            .as_ref()
+            .map(function_effects_to_json)
+            .unwrap_or(JsonValue::Null);
+        let payload = json!({
+            "txid": report.txid.to_hex(),
+            "index_block_hash": index_block_hash,
+            "label": report.label,
+            "effects": effects,
+            "unresolved_contract_calls": report.unresolved_contract_calls,
+            "note": report.note,
+            "call_graph": call_graph,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload).unwrap());
+        return;
+    }
+
+    println!(
+        "Txid: {} (block {})",
+        report.txid.to_hex(),
+        index_block_hash
+    );
+    println!("Type: {}", report.label);
+    if let Some(note) = &report.note {
+        println!("Note: {note}");
+    }
+    if let Some(effects) = &report.effects {
+        print_effects_section("reads", &effects.reads);
+        print_effects_section("writes", &effects.writes);
+        if report.unresolved_contract_calls > 0 {
+            println!(
+                "  unresolved contract calls: {}",
+                report.unresolved_contract_calls
+            );
+        }
+    }
+    if show_graph && !report.call_graph.is_empty() {
+        println!("  call-graph (might-call):");
+        for edge in report.call_graph.iter() {
+            println!(
+                "    - {}.{} -> {}.{}",
+                edge.from_contract,
+                edge.from_function,
+                format_contract_reference(&edge.to_contract),
+                edge.to_function
+            );
+        }
+    }
+}
+
+// Label transactions with a human-readable summary.
+fn tx_label(tx: &StacksTransaction) -> String {
+    match &tx.payload {
+        TransactionPayload::ContractCall(call) => {
+            format!(
+                "contract-call {}.{}",
+                call.contract_identifier(),
+                call.function_name
+            )
+        }
+        TransactionPayload::SmartContract(contract, _) => {
+            format!("deploy {}", contract.name)
+        }
+        TransactionPayload::TokenTransfer(recipient, ..) => {
+            format!("stx-transfer {}", recipient)
+        }
+        _ => tx.payload.name().to_string(),
+    }
+}
+
+// Build effects for an STX transfer using sender and recipient principals.
+fn stx_transfer_effects(tx: &StacksTransaction, recipient: &PrincipalData) -> FunctionEffects {
+    let mut effects = FunctionEffects {
+        purity: Purity::Impure,
+        ..Default::default()
+    };
+    let sender = origin_principal(tx)
+        .map(PrincipalReference::Literal)
+        .unwrap_or(PrincipalReference::Any);
+    let recipient = PrincipalReference::Literal(recipient.clone());
+    for principal in [sender, recipient] {
+        let access = EffectTarget::AssetOwnership(AssetOwnershipAccess {
+            asset: AssetId::Stx,
+            principal,
+        });
+        effects.reads.insert(access.clone());
+        effects.writes.insert(access);
+    }
+    effects
+}
+
+// Add nonce and fee-payer balance effects for transaction validity.
+fn apply_tx_prereqs(effects: &mut FunctionEffects, tx: &StacksTransaction) {
+    let origin = origin_principal(tx)
+        .map(PrincipalReference::Literal)
+        .unwrap_or(PrincipalReference::Any);
+    let nonce_access = EffectTarget::AccountNonce(AccountNonceAccess { principal: origin });
+    effects.reads.insert(nonce_access.clone());
+    effects.writes.insert(nonce_access);
+
+    if let Some(sponsor) = sponsor_principal(tx) {
+        let principal = PrincipalReference::Literal(sponsor);
+        let sponsor_nonce = EffectTarget::AccountNonce(AccountNonceAccess { principal });
+        effects.reads.insert(sponsor_nonce.clone());
+        effects.writes.insert(sponsor_nonce);
+    }
+
+    let payer = payer_principal(tx)
+        .map(PrincipalReference::Literal)
+        .unwrap_or(PrincipalReference::Any);
+    let access = EffectTarget::AssetOwnership(AssetOwnershipAccess {
+        asset: AssetId::stx(),
+        principal: payer,
+    });
+    effects.reads.insert(access.clone());
+    effects.writes.insert(access);
+}
+
+// Build effects for a coinbase transaction.
+fn coinbase_effects(tx: &StacksTransaction, recipient: Option<&PrincipalData>) -> FunctionEffects {
+    let mut effects = FunctionEffects {
+        purity: Purity::Impure,
+        ..Default::default()
+    };
+    let principal = recipient
+        .cloned()
+        .or_else(|| origin_principal(tx))
+        .map(PrincipalReference::Literal)
+        .unwrap_or(PrincipalReference::Any);
+    let access = EffectTarget::AssetOwnership(AssetOwnershipAccess {
+        asset: AssetId::Stx,
+        principal,
+    });
+    effects.reads.insert(access.clone());
+    effects.writes.insert(access);
+    effects
+}
+
+// Build effects for a tenure-change transaction.
+fn tenure_change_effects() -> FunctionEffects {
+    let mut effects = FunctionEffects {
+        purity: Purity::Impure,
+        ..Default::default()
+    };
+    effects
+        .writes
+        .insert(EffectTarget::ChainState(ChainStateRead::TenureInfo));
+    effects
+}
+
+// Extract a contract identifier from a Clarity value, if present.
+fn extract_contract_arg(value: &Value) -> Option<QualifiedContractIdentifier> {
+    match value {
+        Value::Principal(PrincipalData::Contract(contract_id)) => Some(contract_id.clone()),
+        Value::CallableContract(callable) => Some(callable.contract_identifier.clone()),
+        _ => None,
+    }
+}
+
+// Extract a principal from a Clarity value, if present.
+fn extract_principal_arg(value: &Value) -> Option<PrincipalData> {
+    match value {
+        Value::Principal(principal) => Some(principal.clone()),
+        _ => None,
+    }
+}
+
+// Resolve principal arguments within effect targets.
+fn resolve_principal_effects(
+    effects: &FunctionEffects,
+    arg_principals: &[Option<PrincipalData>],
+) -> FunctionEffects {
+    let mut resolved = effects.clone();
+    resolved.reads = resolve_principal_effect_set(&effects.reads, arg_principals);
+    resolved.writes = resolve_principal_effect_set(&effects.writes, arg_principals);
+    resolved
+}
+
+// Resolve principal arguments for an entire effect set.
+fn resolve_principal_effect_set(
+    effects: &BTreeSet<EffectTarget>,
+    arg_principals: &[Option<PrincipalData>],
+) -> BTreeSet<EffectTarget> {
+    effects
+        .iter()
+        .map(|effect| match effect {
+            EffectTarget::AssetOwnership(access) => {
+                let principal = resolve_principal_reference(&access.principal, arg_principals);
+                EffectTarget::AssetOwnership(AssetOwnershipAccess {
+                    asset: access.asset.clone(),
+                    principal,
+                })
+            }
+            EffectTarget::AccountNonce(access) => {
+                let principal = resolve_principal_reference(&access.principal, arg_principals);
+                EffectTarget::AccountNonce(AccountNonceAccess { principal })
+            }
+            other => other.clone(),
+        })
+        .collect()
+}
+
+// Resolve a principal reference using transaction arguments.
+fn resolve_principal_reference(
+    reference: &PrincipalReference,
+    arg_principals: &[Option<PrincipalData>],
+) -> PrincipalReference {
+    match reference {
+        PrincipalReference::Argument(index) => arg_principals
+            .get(*index as usize)
+            .and_then(|value| value.clone())
+            .map(PrincipalReference::Literal)
+            .unwrap_or(PrincipalReference::Any),
+        other => other.clone(),
+    }
+}
+
+// Cache contract analysis results and indicate whether effects are available.
+fn load_contract_effects(
+    clarity_tx: &mut ClarityReadOnlyConnection,
+    contract_id: &QualifiedContractIdentifier,
+    contract_effects: &mut BTreeMap<
+        QualifiedContractIdentifier,
+        BTreeMap<ClarityName, FunctionEffects>,
+    >,
+) -> Result<Option<()>, String> {
+    if !contract_effects.contains_key(contract_id) {
+        let contract_source =
+            clarity_tx.with_clarity_db_readonly(|db| db.get_contract_src(contract_id));
+        let Some(contract_source) = contract_source else {
+            return Ok(None);
+        };
+
+        let clarity_version = clarity_tx
+            .with_analysis_db_readonly(|db| db.get_clarity_version(contract_id).ok())
+            .unwrap_or_else(|| ClarityVersion::default_for_epoch(clarity_tx.get_epoch()));
+        let epoch = clarity_tx.get_epoch();
+        let mut cost_track = LimitedCostTracker::new_free();
+        let contract_ast = build_ast(
+            contract_id,
+            &contract_source,
+            &mut cost_track,
+            clarity_version,
+            epoch,
+        )
+        .map_err(|e| format!("Failed to parse contract {contract_id}: {e}"))?;
+        let analysis_result = clarity_tx.with_analysis_db_readonly(|db| {
+            run_analysis(
+                contract_id,
+                &contract_ast.expressions,
+                db,
+                false,
+                cost_track,
+                epoch,
+                clarity_version,
+                false,
+            )
+        });
+        let analysis = analysis_result
+            .map_err(|e| format!("Failed to analyze contract {contract_id}: {}", e.0))?;
+        contract_effects.insert(contract_id.clone(), analysis.function_effects);
+    }
+    Ok(Some(()))
+}
+
+// Resolve contract-call effects by loading referenced contracts until no further progress.
+fn resolve_contract_calls_across_contracts(
+    effects: &FunctionEffects,
+    arg_contracts: &[Option<QualifiedContractIdentifier>],
+    contract_effects: &mut BTreeMap<
+        QualifiedContractIdentifier,
+        BTreeMap<ClarityName, FunctionEffects>,
+    >,
+    clarity_tx: &mut ClarityReadOnlyConnection,
+) -> Result<FunctionEffects, String> {
+    resolve_contract_effects_transitively(contract_effects);
+    let mut resolved = effects.resolve_contract_calls(arg_contracts, contract_effects);
+    loop {
+        let mut loaded_any = false;
+        let calls: Vec<ContractCall> = resolved.contract_calls.iter().cloned().collect();
+        for call in calls {
+            if let ContractReference::Literal(contract_id) = call.contract
+                && !contract_effects.contains_key(&contract_id)
+            {
+                if (load_contract_effects(clarity_tx, &contract_id, contract_effects)?).is_none() {
+                    continue;
+                }
+                loaded_any = true;
+            }
+        }
+        if !loaded_any {
+            break;
+        }
+        resolve_contract_effects_transitively(contract_effects);
+        let next = resolved.resolve_contract_calls(arg_contracts, contract_effects);
+        if next == resolved {
+            break;
+        }
+        resolved = next;
+    }
+    Ok(resolved)
+}
+
+// Build a principal from the transaction origin if possible.
+fn origin_principal(tx: &StacksTransaction) -> Option<PrincipalData> {
+    let origin = tx.get_origin();
+    let addr = if tx.is_mainnet() {
+        origin.address_mainnet()
+    } else {
+        origin.address_testnet()
+    };
+    Some(PrincipalData::from(addr))
+}
+
+// Build the contract identifier for a smart contract deploy.
+fn contract_deploy_identifier(
+    tx: &StacksTransaction,
+    contract: &TransactionSmartContract,
+) -> Option<QualifiedContractIdentifier> {
+    let origin = origin_principal(tx)?;
+    let issuer = match origin {
+        PrincipalData::Standard(issuer) => issuer,
+        _ => return None,
+    };
+    Some(QualifiedContractIdentifier::new(
+        issuer,
+        contract.name.clone(),
+    ))
+}
+
+// Build a principal from the fee payer account.
+fn payer_principal(tx: &StacksTransaction) -> Option<PrincipalData> {
+    let payer = tx.get_payer();
+    Some(spending_condition_principal(&payer, tx.is_mainnet()))
+}
+
+// Build a principal for the sponsor account, if any.
+fn sponsor_principal(tx: &StacksTransaction) -> Option<PrincipalData> {
+    tx.auth
+        .sponsor()
+        .map(|condition| spending_condition_principal(condition, tx.is_mainnet()))
+}
+
+// Convert a spending condition into a principal based on network.
+fn spending_condition_principal(
+    condition: &TransactionSpendingCondition,
+    is_mainnet: bool,
+) -> PrincipalData {
+    let addr = if is_mainnet {
+        condition.address_mainnet()
+    } else {
+        condition.address_testnet()
+    };
+    PrincipalData::from(addr)
+}
+
+fn read_hex_arg(arg: &str) -> Result<String, String> {
+    let trimmed = arg.trim();
+    if trimmed == "-" {
+        let mut input = String::new();
+        io::stdin()
+            .read_to_string(&mut input)
+            .map_err(|e| format!("Failed to read stdin: {e}"))?;
+        return Ok(input);
+    }
+    let path = if let Some(stripped) = trimmed.strip_prefix('@') {
+        stripped
+    } else {
+        trimmed
+    };
+    if Path::new(path).exists() {
+        fs::read_to_string(path).map_err(|e| format!("Failed to read {path}: {e}"))
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn parse_tx_from_hex(tx_hex: &str) -> Result<StacksTransaction, String> {
+    let bytes = hex_bytes(tx_hex.trim()).map_err(|e| format!("Invalid hex: {e:?}"))?;
+    let mut cursor = &bytes[..];
+    StacksTransaction::consensus_deserialize(&mut cursor)
+        .map_err(|e| format!("Failed to parse tx: {e:?}"))
+}
+
+fn parse_txid_hex(txid_hex: &str) -> Result<Txid, String> {
+    let bytes = hex_bytes(txid_hex.trim()).map_err(|e| format!("Invalid txid: {e:?}"))?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "Invalid txid length: expected 32 bytes, got {}",
+            bytes.len()
+        ));
+    }
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(&bytes);
+    Ok(Txid(buf))
+}
+
+fn parse_block_id_hex(block_hex: &str) -> Result<StacksBlockId, String> {
+    StacksBlockId::from_hex(block_hex.trim()).map_err(|e| format!("Invalid block id: {e:?}"))
+}
+
+fn load_tx_from_chainstate(
+    db_path: &str,
+    txid: &Txid,
+    block_id: Option<&StacksBlockId>,
+    conf: Option<&Config>,
+) -> Result<(StacksTransaction, String), String> {
+    let conf = conf.unwrap_or(&DEFAULT_MAINNET_CONFIG);
+    let chain_state_path = format!("{db_path}/chainstate/");
+    let (chainstate, _) = StacksChainState::open(
+        conf.is_mainnet(),
+        conf.burnchain.chain_id,
+        &chain_state_path,
+        None,
+    )
+    .map_err(|e| format!("Failed to open chainstate at {chain_state_path}: {e:?}"))?;
+
+    let conn = chainstate.db();
+    let sql = "SELECT tx_hex, index_block_hash FROM transactions WHERE txid = ?1 LIMIT 1";
+    let txid_hex = txid.to_hex();
+    let row: Option<(String, String)> = conn
+        .query_row(sql, params![txid_hex], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()
+        .map_err(|e| format!("Failed to query transactions: {e}"))?;
+    let Some((tx_hex, index_block_hash)) = row else {
+        let Some(block_id) = block_id else {
+            return Err(format!(
+                "Transaction {txid_hex} not found in chainstate (txindex may be disabled). \
+Provide --block-id to scan a specific block."
+            ));
+        };
+        return load_tx_from_block(&chainstate, txid, block_id);
+    };
+    let tx = parse_tx_from_hex(&tx_hex)?;
+    Ok((tx, index_block_hash))
+}
+
+fn load_tx_from_block(
+    chainstate: &StacksChainState,
+    txid: &Txid,
+    block_id: &StacksBlockId,
+) -> Result<(StacksTransaction, String), String> {
+    if let Some((block, _)) = chainstate
+        .nakamoto_blocks_db()
+        .get_nakamoto_block(block_id)
+        .map_err(|e| format!("Failed to load Nakamoto block {block_id}: {e:?}"))?
+    {
+        if let Some(tx) = block.txs.into_iter().find(|tx| &tx.txid() == txid) {
+            return Ok((tx, block_id.to_string()));
+        }
+        return Err(format!(
+            "Transaction {} not found in Nakamoto block {block_id}.",
+            txid.to_hex()
+        ));
+    }
+
+    let has_block = StacksChainState::has_block_indexed(&chainstate.blocks_path, block_id)
+        .map_err(|e| format!("Failed to check chunk store for {block_id}: {e:?}"))?;
+    if !has_block {
+        return Err(format!(
+            "Block {block_id} not found in chainstate (no Nakamoto block and no chunk store file)."
+        ));
+    }
+
+    let block_path = StacksChainState::get_index_block_path(&chainstate.blocks_path, block_id)
+        .map_err(|e| format!("Failed to resolve block path for {block_id}: {e:?}"))?;
+    let block: StacksBlock = StacksChainState::consensus_load(&block_path)
+        .map_err(|e| format!("Failed to load block {block_id} from chunk store: {e:?}"))?;
+    if let Some(tx) = block.txs.into_iter().find(|tx| &tx.txid() == txid) {
+        return Ok((tx, block_id.to_string()));
+    }
+    Err(format!(
+        "Transaction {} not found in block {block_id}.",
+        txid.to_hex()
+    ))
+}
+
+fn print_effects_section(label: &str, effects: &std::collections::BTreeSet<EffectTarget>) {
+    if effects.is_empty() {
+        return;
+    }
+    println!("  {label}:");
+    for effect in effects {
+        println!("    - {}", format_effect_target(effect));
+    }
+}
+
+// Collect contract analyses starting from a root contract and following literal contract calls.
+fn collect_contract_effects_recursive(
+    clarity_tx: &mut ClarityReadOnlyConnection,
+    root_contract: &QualifiedContractIdentifier,
+    root_effects: &BTreeMap<ClarityName, FunctionEffects>,
+) -> Result<BTreeMap<QualifiedContractIdentifier, BTreeMap<ClarityName, FunctionEffects>>, String> {
+    let mut contracts = BTreeMap::new();
+    contracts.insert(root_contract.clone(), root_effects.clone());
+    let mut queue = vec![root_contract.clone()];
+    let mut visited = BTreeSet::new();
+
+    while let Some(contract_id) = queue.pop() {
+        if !visited.insert(contract_id.clone()) {
+            continue;
+        }
+        let callees = contracts
+            .get(&contract_id)
+            .map(|functions| {
+                functions
+                    .values()
+                    .flat_map(|effects| effects.contract_calls.iter())
+                    .filter_map(|call| match &call.contract {
+                        ContractReference::Literal(id) => Some(id.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        for callee in callees {
+            if contracts.contains_key(&callee) {
+                continue;
+            }
+            if load_contract_effects(clarity_tx, &callee, &mut contracts)?.is_some() {
+                queue.push(callee);
+            }
+        }
+    }
+
+    Ok(contracts)
+}
+
+// Resolve contract-call effects transitively across a set of contracts.
+fn resolve_contract_effects_transitively(
+    contracts: &mut BTreeMap<QualifiedContractIdentifier, BTreeMap<ClarityName, FunctionEffects>>,
+) {
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let snapshot = contracts.clone();
+        for functions in contracts.values_mut() {
+            for effects in functions.values_mut() {
+                let resolved = effects.resolve_contract_calls(&[], &snapshot);
+                if *effects != resolved {
+                    *effects = resolved;
+                    changed = true;
+                }
+            }
+        }
+    }
+}
+
+fn format_effect_target(effect: &EffectTarget) -> String {
+    match effect {
+        EffectTarget::Contract(access) => {
+            let contract = format_contract_reference(&access.contract);
+            let location = match &access.location {
+                Some(StorageLocation::DataMap(name)) => format!("map {name}"),
+                Some(StorageLocation::DataVar(name)) => format!("var {name}"),
+                None => "any".to_string(),
+            };
+            format!("contract {contract} ({location})")
+        }
+        EffectTarget::AssetOwnership(access) => {
+            let asset = format_asset_id(&access.asset);
+            let principal = format_principal_reference(&access.principal);
+            format!("asset {asset} principal {principal}")
+        }
+        EffectTarget::AccountNonce(access) => {
+            let principal = format_principal_reference(&access.principal);
+            format!("account-nonce {principal}")
+        }
+        EffectTarget::ChainState(read) => format!("chain-state {}", format_chain_read(read)),
+    }
+}
+
+fn effect_target_to_json(effect: &EffectTarget) -> JsonValue {
+    match effect {
+        EffectTarget::Contract(access) => {
+            let contract = format_contract_reference(&access.contract);
+            let location = match &access.location {
+                Some(StorageLocation::DataMap(name)) => json!({"DataMap": name.to_string()}),
+                Some(StorageLocation::DataVar(name)) => json!({"DataVar": name.to_string()}),
+                None => JsonValue::Null,
+            };
+            json!({
+                "Contract": {
+                    "contract": contract,
+                    "location": location,
+                }
+            })
+        }
+        EffectTarget::AssetOwnership(access) => {
+            let asset = format_asset_id(&access.asset);
+            let principal = format_principal_reference(&access.principal);
+            json!({
+                "AssetOwnership": {
+                    "asset": asset,
+                    "principal": principal,
+                }
+            })
+        }
+        EffectTarget::AccountNonce(access) => {
+            let principal = format_principal_reference(&access.principal);
+            json!({
+                "AccountNonce": {
+                    "principal": principal,
+                }
+            })
+        }
+        EffectTarget::ChainState(read) => json!({
+            "ChainState": format_chain_read(read),
+        }),
+    }
+}
+
+fn effect_set_to_json(effects: &BTreeSet<EffectTarget>) -> JsonValue {
+    let entries = effects
+        .iter()
+        .map(effect_target_to_json)
+        .collect::<Vec<_>>();
+    JsonValue::Array(entries)
+}
+
+fn function_effects_to_json(effects: &FunctionEffects) -> JsonValue {
+    let calls = effects
+        .contract_calls
+        .iter()
+        .map(|call| {
+            json!({
+                "contract": format_contract_reference(&call.contract),
+                "function": call.function.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "purity": format!("{:?}", effects.purity),
+        "reads": effect_set_to_json(&effects.reads),
+        "writes": effect_set_to_json(&effects.writes),
+        "contract_calls": calls,
+    })
+}
+
+fn format_contract_reference(reference: &ContractReference) -> String {
+    match reference {
+        ContractReference::Any => "<any>".to_string(),
+        ContractReference::Literal(contract) => contract.to_string(),
+        ContractReference::Argument(index) => format!("$arg[{index}]"),
+    }
+}
+
+fn format_principal_reference(reference: &PrincipalReference) -> String {
+    match reference {
+        PrincipalReference::Any => "<any>".to_string(),
+        PrincipalReference::Literal(principal) => principal.to_string(),
+        PrincipalReference::Argument(index) => format!("$arg[{index}]"),
+    }
+}
+
+fn format_chain_read(read: &ChainStateRead) -> &'static str {
+    match read {
+        ChainStateRead::BlockInfo => "block-info",
+        ChainStateRead::StacksBlockInfo => "stacks-block-info",
+        ChainStateRead::BurnBlockInfo => "burn-block-info",
+        ChainStateRead::TenureInfo => "tenure-info",
+    }
+}
+
+fn format_asset_id(asset: &AssetId) -> String {
+    match asset {
+        AssetId::Stx => "stx".to_string(),
+        AssetId::Token {
+            contract,
+            name,
+            kind,
+        } => {
+            let kind_label = match kind {
+                TokenKind::Fungible => "ft",
+                TokenKind::NonFungible => "nft",
+            };
+            format!("{contract}.{name} ({kind_label})")
+        }
+    }
 }
 
 /// Fetch and process a `StagingBlock` from database and call `replay_block()` to validate

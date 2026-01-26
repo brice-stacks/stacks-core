@@ -164,9 +164,15 @@ pub struct AssetOwnershipAccess {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AccountNonceAccess {
+    pub principal: PrincipalReference,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EffectTarget {
     Contract(ContractStorageAccess),
     AssetOwnership(AssetOwnershipAccess),
+    AccountNonce(AccountNonceAccess),
     ChainState(ChainStateRead),
 }
 
