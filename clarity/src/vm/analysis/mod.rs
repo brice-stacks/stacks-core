@@ -17,6 +17,7 @@
 pub mod analysis_db;
 pub mod arithmetic_checker;
 pub mod contract_interface_builder;
+pub mod effects_analyzer;
 pub mod errors;
 pub mod read_only_checker;
 pub mod trait_checker;
@@ -28,6 +29,7 @@ use stacks_common::types::StacksEpochId;
 pub use self::analysis_db::AnalysisDatabase;
 use self::arithmetic_checker::ArithmeticOnlyChecker;
 use self::contract_interface_builder::build_contract_interface;
+use self::effects_analyzer::EffectsAnalyzer;
 pub use self::errors::{
     CommonCheckErrorKind, RuntimeCheckErrorKind, StaticCheckError, StaticCheckErrorKind,
 };
@@ -161,6 +163,7 @@ pub fn run_analysis(
             }
         }?;
         TraitChecker::run_pass(&epoch, &mut contract_analysis, db)?;
+        EffectsAnalyzer::run_pass(&epoch, &mut contract_analysis, db)?;
         ArithmeticOnlyChecker::check_contract_cost_eligible(&mut contract_analysis);
 
         if STORE_CONTRACT_SRC_INTERFACE {

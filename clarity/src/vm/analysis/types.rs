@@ -14,10 +14,13 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use clarity_types::representations::ClarityName;
-use clarity_types::types::{QualifiedContractIdentifier, TraitIdentifier, TypeSignature};
+use clarity_types::types::{
+    PrincipalData, QualifiedContractIdentifier, TraitIdentifier, TypeSignature,
+};
 use stacks_common::types::StacksEpochId;
 
 use crate::vm::analysis::analysis_db::AnalysisDatabase;
@@ -42,6 +45,186 @@ pub trait AnalysisPass {
     ) -> Result<(), StaticCheckError>;
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum PrincipalReference {
+    Any,
+    Literal(PrincipalData),
+}
+
+impl PartialOrd for PrincipalReference {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PrincipalReference {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (PrincipalReference::Any, PrincipalReference::Any) => Ordering::Equal,
+            (PrincipalReference::Any, _) => Ordering::Less,
+            (_, PrincipalReference::Any) => Ordering::Greater,
+            (PrincipalReference::Literal(left), PrincipalReference::Literal(right)) => {
+                left.to_string().cmp(&right.to_string())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StorageLocation {
+    DataMap(ClarityName),
+    DataVar(ClarityName),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ContractReference {
+    /// Dynamic contract that can't be resolved statically.
+    Any,
+    /// Literal contract principal.
+    Literal(QualifiedContractIdentifier),
+    /// Contract principal supplied via function argument index.
+    Argument(u32),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ChainStateRead {
+    /// `get-block-info?` read
+    BlockInfo,
+    /// `get-stacks-block-info?` read
+    StacksBlockInfo,
+    /// `get-burn-block-info?` read
+    BurnBlockInfo,
+    /// `get-tenure-info?` read
+    TenureInfo,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ContractStorageAccess {
+    pub contract: ContractReference,
+    pub location: Option<StorageLocation>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ContractCall {
+    /// Target contract for the call (literal, argument, or unknown).
+    pub contract: ContractReference,
+    /// Target function name within the contract.
+    pub function: ClarityName,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TokenKind {
+    Fungible,
+    NonFungible,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AssetId {
+    Stx,
+    Token {
+        contract: QualifiedContractIdentifier,
+        name: ClarityName,
+        kind: TokenKind,
+    },
+}
+
+impl AssetId {
+    /// Helper for constructing STX ownership effects.
+    pub fn stx() -> Self {
+        AssetId::Stx
+    }
+
+    /// Helper for constructing FT/NFT ownership effects.
+    pub fn token(
+        contract: QualifiedContractIdentifier,
+        name: ClarityName,
+        kind: TokenKind,
+    ) -> Self {
+        AssetId::Token {
+            contract,
+            name,
+            kind,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AssetOwnershipAccess {
+    pub asset: AssetId,
+    pub principal: PrincipalReference,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EffectTarget {
+    Contract(ContractStorageAccess),
+    AssetOwnership(AssetOwnershipAccess),
+    ChainState(ChainStateRead),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+pub enum Purity {
+    #[default]
+    Unknown,
+    Pure,
+    Impure,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+pub struct FunctionEffects {
+    /// Direct reads performed by this function body.
+    pub reads: BTreeSet<EffectTarget>,
+    /// Direct writes performed by this function body.
+    pub writes: BTreeSet<EffectTarget>,
+    /// Contract calls that should be resolved across contracts.
+    #[serde(default)]
+    pub contract_calls: BTreeSet<ContractCall>,
+    /// Purity classification based on collected effects.
+    pub purity: Purity,
+}
+
+impl FunctionEffects {
+    /// Resolve contract-call placeholders using known callee effects and argument bindings.
+    pub fn resolve_contract_calls(
+        &self,
+        arg_contracts: &[Option<QualifiedContractIdentifier>],
+        contracts: &BTreeMap<QualifiedContractIdentifier, BTreeMap<ClarityName, FunctionEffects>>,
+    ) -> FunctionEffects {
+        let mut resolved = self.clone();
+        resolved.contract_calls.clear();
+
+        for call in self.contract_calls.iter() {
+            let contract = match &call.contract {
+                ContractReference::Literal(id) => Some(id.clone()),
+                ContractReference::Argument(index) => arg_contracts
+                    .get(*index as usize)
+                    .and_then(|entry| entry.clone()),
+                ContractReference::Any => None,
+            };
+
+            if let Some(contract_id) = contract {
+                if let Some(functions) = contracts.get(&contract_id)
+                    && let Some(effects) = functions.get(&call.function)
+                {
+                    resolved.reads.extend(effects.reads.iter().cloned());
+                    resolved.writes.extend(effects.writes.iter().cloned());
+                    resolved
+                        .contract_calls
+                        .extend(effects.contract_calls.iter().cloned());
+                    continue;
+                }
+                resolved.contract_calls.insert(ContractCall {
+                    contract: ContractReference::Literal(contract_id),
+                    function: call.function.clone(),
+                });
+            } else {
+                resolved.contract_calls.insert(call.clone());
+            }
+        }
+
+        resolved
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct ContractAnalysis {
     pub contract_identifier: QualifiedContractIdentifier,
@@ -56,6 +239,8 @@ pub struct ContractAnalysis {
     pub defined_traits: BTreeMap<ClarityName, BTreeMap<ClarityName, FunctionSignature>>,
     pub implemented_traits: BTreeSet<TraitIdentifier>,
     pub contract_interface: Option<ContractInterface>,
+    #[serde(default)]
+    pub function_effects: BTreeMap<ClarityName, FunctionEffects>,
     pub is_cost_contract_eligible: bool,
     pub epoch: StacksEpochId,
     pub clarity_version: ClarityVersion,
@@ -90,6 +275,7 @@ impl ContractAnalysis {
             implemented_traits: BTreeSet::new(),
             fungible_tokens: BTreeSet::new(),
             non_fungible_tokens: BTreeMap::new(),
+            function_effects: BTreeMap::new(),
             cost_track: Some(cost_track),
             is_cost_contract_eligible: false,
             epoch,

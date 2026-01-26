@@ -19,6 +19,7 @@ use stacks_common::types::StacksEpochId;
 use crate::vm::ClarityVersion;
 use crate::vm::analysis::mem_type_check as mem_run_analysis;
 use crate::vm::analysis::type_checker::v2_1::tests::mem_type_check;
+mod effects_analyzer;
 
 #[test]
 fn test_list_types_must_match() {

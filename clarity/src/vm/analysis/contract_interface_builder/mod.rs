@@ -50,6 +50,7 @@ pub fn build_contract_interface(
         type_map: _,
         cost_track: _,
         contract_interface: _,
+        function_effects: _,
         is_cost_contract_eligible: _,
     } = contract_analysis;
 
