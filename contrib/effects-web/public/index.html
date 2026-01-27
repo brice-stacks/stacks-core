@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Clarity Effects Preview</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="ambient">
+      <div class="glow glow-1"></div>
+      <div class="glow glow-2"></div>
+      <div class="grid"></div>
+    </div>
+
+    <main class="page">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Clarity Effects Preview</p>
+          <h1>
+            See what a contract function
+            <span class="accent">can do</span> before you call it.
+          </h1>
+          <p class="subhead">
+            Load a contract from chainstate, browse functions, and inspect
+            reads, writes, and call‑graph impact.
+          </p>
+        </div>
+        <div class="hero-panel">
+          <div class="label">Network</div>
+          <div class="network-toggle">
+            <button class="pill active" data-network="testnet">
+              Testnet
+            </button>
+            <button class="pill" data-network="mainnet">Mainnet</button>
+          </div>
+          <div class="label">Mode</div>
+          <div class="network-toggle mode-toggle">
+            <button class="pill active" data-mode="contract">Contract</button>
+            <button class="pill" data-mode="transaction">Transaction</button>
+          </div>
+          <div id="contractInputPanel">
+          <label class="label" for="contractId">Contract ID</label>
+          <div class="input-row">
+            <input
+              id="contractId"
+              type="text"
+              placeholder="ST... .contract-name"
+            />
+            <button id="loadContract" class="primary">Load</button>
+          </div>
+          </div>
+          <div class="divider"></div>
+          <div id="txInputPanel" class="hidden">
+          <label class="label" for="txidInput">Transaction ID</label>
+          <div class="input-row">
+            <input id="txidInput" type="text" placeholder="0x… or hex txid" />
+          </div>
+          <label class="label" for="blockIdInput">Block ID (optional)</label>
+          <div class="input-row">
+            <input id="blockIdInput" type="text" placeholder="index block hash" />
+            <button id="loadTx" class="primary secondary">Analyze</button>
+          </div>
+          </div>
+          <p class="hint" id="statusText">Waiting for a contract…</p>
+        </div>
+      </header>
+
+      <section class="content">
+        <aside class="panel functions">
+          <div class="panel-header">
+            <h2 id="functionHeaderTitle">Functions</h2>
+            <span id="functionCount">0</span>
+          </div>
+          <div id="functionList" class="function-list">
+            <div class="empty">Load a contract to view functions.</div>
+          </div>
+        </aside>
+
+        <section class="panel details">
+          <div class="panel-header">
+            <h2 id="functionTitle">Select a function</h2>
+            <span id="functionBadge" class="badge">—</span>
+          </div>
+
+          <div id="txSummary" class="tx-summary hidden">
+            <div class="tx-summary-header">
+              <h3>Transaction Call</h3>
+              <span id="txLabel" class="badge subtle">contract-call</span>
+            </div>
+            <div class="tx-summary-grid">
+              <div>
+                <div class="label">Contract</div>
+                <div id="txContract" class="mono">—</div>
+              </div>
+              <div>
+                <div class="label">Function</div>
+                <div id="txFunction" class="mono">—</div>
+              </div>
+              <div>
+                <div class="label">Txid</div>
+                <div id="txTxid" class="mono">—</div>
+              </div>
+              <div>
+                <div class="label">Block</div>
+                <div id="txBlock" class="mono">—</div>
+              </div>
+            </div>
+            <div class="label">Arguments</div>
+            <div id="txArgs" class="tx-args">
+              <div class="empty">No arguments.</div>
+            </div>
+          </div>
+
+          <div class="section" id="argSection">
+            <h3>Arguments</h3>
+            <div id="argForm" class="arg-form">
+              <div class="empty">Pick a function to see its arguments.</div>
+            </div>
+          </div>
+
+          <div class="section">
+            <div class="section-header">
+              <h3>Call Graph</h3>
+              <span class="badge subtle">Mermaid</span>
+            </div>
+            <div id="callGraph" class="call-graph">
+              <div class="empty">No function selected.</div>
+            </div>
+          </div>
+
+          <div class="section">
+            <h3>Effects Summary</h3>
+            <div class="chips" id="effectChips">
+              <span class="chip">Reads: —</span>
+              <span class="chip">Writes: —</span>
+              <span class="chip">Calls: —</span>
+              <span class="chip">Assets: —</span>
+            </div>
+            <div class="effects-grid">
+              <div class="effects-column">
+                <h4>Reads</h4>
+                <div id="readsList" class="effects-list empty">
+                  No data yet.
+                </div>
+              </div>
+              <div class="effects-column">
+                <h4>Writes</h4>
+                <div id="writesList" class="effects-list empty">
+                  No data yet.
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>

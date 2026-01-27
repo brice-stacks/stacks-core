@@ -1119,6 +1119,9 @@ struct TxEffectsReport {
     unresolved_contract_calls: usize,
     note: Option<String>,
     call_graph: Vec<CallGraphEdge>,
+    call_contract: Option<String>,
+    call_function: Option<String>,
+    call_args: Option<Vec<String>>,
 }
 
 fn analyze_tx_effects_with_chainstate(
@@ -1182,6 +1185,14 @@ fn analyze_tx_effects(
     match &tx.payload {
         TransactionPayload::ContractCall(call) => {
             let contract_id = call.contract_identifier();
+            let call_contract = Some(contract_id.to_string());
+            let call_function = Some(call.function_name.to_string());
+            let call_args = Some(
+                call.function_args
+                    .iter()
+                    .map(|arg| arg.to_string())
+                    .collect::<Vec<_>>(),
+            );
             let effects_map =
                 match load_contract_effects(clarity_tx, &contract_id, &mut contract_effects) {
                     Ok(Some(())) => contract_effects.get(&contract_id),
@@ -1194,6 +1205,9 @@ fn analyze_tx_effects(
                             unresolved_contract_calls: 0,
                             note: Some(err),
                             call_graph: Vec::new(),
+                            call_contract,
+                            call_function,
+                            call_args,
                         };
                     }
                 };
@@ -1205,6 +1219,9 @@ fn analyze_tx_effects(
                     unresolved_contract_calls: 0,
                     note: Some("missing contract source".to_string()),
                     call_graph: Vec::new(),
+                    call_contract,
+                    call_function,
+                    call_args,
                 };
             };
             let Some(root_effects) = effects_map.get(&call.function_name).cloned() else {
@@ -1215,6 +1232,9 @@ fn analyze_tx_effects(
                     unresolved_contract_calls: 0,
                     note: Some("missing function analysis".to_string()),
                     call_graph: Vec::new(),
+                    call_contract,
+                    call_function,
+                    call_args,
                 };
             };
 
@@ -1260,6 +1280,9 @@ fn analyze_tx_effects(
                         unresolved_contract_calls: 0,
                         note: Some(err),
                         call_graph,
+                        call_contract,
+                        call_function,
+                        call_args,
                     };
                 }
             };
@@ -1274,6 +1297,9 @@ fn analyze_tx_effects(
                 unresolved_contract_calls: unresolved,
                 note: None,
                 call_graph,
+                call_contract,
+                call_function,
+                call_args,
             }
         }
         TransactionPayload::SmartContract(contract, clarity_version_opt) => {
@@ -1285,6 +1311,9 @@ fn analyze_tx_effects(
                     unresolved_contract_calls: 0,
                     note: Some("missing origin principal".to_string()),
                     call_graph: Vec::new(),
+                    call_contract: None,
+                    call_function: None,
+                    call_args: None,
                 };
             };
             let epoch = clarity_tx.get_epoch();
@@ -1308,6 +1337,9 @@ fn analyze_tx_effects(
                         unresolved_contract_calls: 0,
                         note: Some(format!("Failed to parse contract: {err}")),
                         call_graph: Vec::new(),
+                        call_contract: None,
+                        call_function: None,
+                        call_args: None,
                     };
                 }
             };
@@ -1333,6 +1365,9 @@ fn analyze_tx_effects(
                         unresolved_contract_calls: 0,
                         note: Some(format!("Failed to analyze contract: {}", err.0)),
                         call_graph: Vec::new(),
+                        call_contract: None,
+                        call_function: None,
+                        call_args: None,
                     };
                 }
             };
@@ -1346,6 +1381,9 @@ fn analyze_tx_effects(
                         unresolved_contract_calls: 0,
                         note: Some(format!("Failed to analyze deploy effects: {err}")),
                         call_graph: Vec::new(),
+                        call_contract: None,
+                        call_function: None,
+                        call_args: None,
                     };
                 }
             };
@@ -1377,6 +1415,9 @@ fn analyze_tx_effects(
                         unresolved_contract_calls: 0,
                         note: Some(err),
                         call_graph,
+                        call_contract: None,
+                        call_function: None,
+                        call_args: None,
                     };
                 }
             };
@@ -1389,6 +1430,9 @@ fn analyze_tx_effects(
                 unresolved_contract_calls: unresolved,
                 note: None,
                 call_graph,
+                call_contract: None,
+                call_function: None,
+                call_args: None,
             }
         }
         TransactionPayload::TokenTransfer(recipient, ..) => {
@@ -1401,6 +1445,9 @@ fn analyze_tx_effects(
                 unresolved_contract_calls: 0,
                 note: None,
                 call_graph: Vec::new(),
+                call_contract: None,
+                call_function: None,
+                call_args: None,
             }
         }
         TransactionPayload::Coinbase(_payload, recipient_opt, _vrf_opt) => {
@@ -1413,6 +1460,9 @@ fn analyze_tx_effects(
                 unresolved_contract_calls: 0,
                 note: None,
                 call_graph: Vec::new(),
+                call_contract: None,
+                call_function: None,
+                call_args: None,
             }
         }
         TransactionPayload::TenureChange(_payload) => {
@@ -1425,6 +1475,9 @@ fn analyze_tx_effects(
                 unresolved_contract_calls: 0,
                 note: None,
                 call_graph: Vec::new(),
+                call_contract: None,
+                call_function: None,
+                call_args: None,
             }
         }
         _ => TxEffectsReport {
@@ -1434,6 +1487,9 @@ fn analyze_tx_effects(
             unresolved_contract_calls: 0,
             note: Some("unsupported payload".to_string()),
             call_graph: Vec::new(),
+            call_contract: None,
+            call_function: None,
+            call_args: None,
         },
     }
 }
@@ -1501,6 +1557,9 @@ fn print_tx_effects_report(report: &TxEffectsReport, json_output: bool, show_gra
             "unresolved_contract_calls": report.unresolved_contract_calls,
             "note": report.note,
             "call_graph": call_graph,
+            "call_contract": report.call_contract,
+            "call_function": report.call_function,
+            "call_args": report.call_args,
         });
         println!("{}", serde_json::to_string_pretty(&payload).unwrap());
         return;
@@ -1568,6 +1627,9 @@ fn print_txid_effects_report(
             "unresolved_contract_calls": report.unresolved_contract_calls,
             "note": report.note,
             "call_graph": call_graph,
+            "call_contract": report.call_contract,
+            "call_function": report.call_function,
+            "call_args": report.call_args,
         });
         println!("{}", serde_json::to_string_pretty(&payload).unwrap());
         return;
@@ -1988,6 +2050,10 @@ fn load_tx_from_chainstate(
     )
     .map_err(|e| format!("Failed to open chainstate at {chain_state_path}: {e:?}"))?;
 
+    if let Some(block_id) = block_id {
+        return load_tx_from_block(&chainstate, txid, block_id);
+    }
+
     let conn = chainstate.db();
     let sql = "SELECT tx_hex, index_block_hash FROM transactions WHERE txid = ?1 LIMIT 1";
     let txid_hex = txid.to_hex();
@@ -1996,13 +2062,10 @@ fn load_tx_from_chainstate(
         .optional()
         .map_err(|e| format!("Failed to query transactions: {e}"))?;
     let Some((tx_hex, index_block_hash)) = row else {
-        let Some(block_id) = block_id else {
-            return Err(format!(
-                "Transaction {txid_hex} not found in chainstate (txindex may be disabled). \
+        return Err(format!(
+            "Transaction {txid_hex} not found in chainstate (txindex may be disabled). \
 Provide --block-id to scan a specific block."
-            ));
-        };
-        return load_tx_from_block(&chainstate, txid, block_id);
+        ));
     };
     let tx = parse_tx_from_hex(&tx_hex)?;
     Ok((tx, index_block_hash))
