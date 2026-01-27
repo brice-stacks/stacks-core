@@ -1,5 +1,10 @@
 # Clarity Effects Analyzer
 
+
+https://github.com/user-attachments/assets/44ba84dc-98e3-4e90-8cd2-d2f19568f556
+
+
+
 ## What it does
 
 Static analysis pass that reports:
@@ -106,8 +111,8 @@ Type: contract-call ST1Q45DJT4SQF2Q7TPGQS3Q52GBM495QRR4AJYGB5.lending-pool-v7.su
 
 ## Sample Web UI: Contract Mode
 
-![Contract mode](images/contract-mode.png)
+<img width="3936" height="3848" alt="contract-mode" src="https://github.com/user-attachments/assets/b2bb4316-3c0f-4c0b-8ea5-cd7162338f64" />
 
 ## Sample Web UI: Transaction Mode
 
-![Transaction mode](images/transaction-mode.png)
+<img width="3936" height="3976" alt="transaction-mode" src="https://github.com/user-attachments/assets/05fb0d00-1086-45e4-8cb8-17199fdb7f96" />
