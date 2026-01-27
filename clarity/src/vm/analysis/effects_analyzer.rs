@@ -674,9 +674,16 @@ impl EffectsAnalyzer {
                             .unwrap_or(ContractReference::Any),
                         _ => ContractReference::Any,
                     };
+                    let arg_principals = args
+                        .iter()
+                        .skip(2)
+                        .map(|expr| self.resolve_principal(expr, param_indices, bindings))
+                        .collect();
                     effects.contract_calls.insert(ContractCallEffect {
                         contract,
                         function: function_name.clone(),
+                        arg_principals,
+                        caller: Some(self.contract_identifier.clone()),
                     });
                 }
             }
@@ -695,17 +702,41 @@ impl EffectsAnalyzer {
             SymbolicExpressionType::LiteralValue(Value::Principal(principal)) => {
                 PrincipalReference::Literal(principal.clone())
             }
-            SymbolicExpressionType::Atom(name) => bindings
-                .get(name)
-                .cloned()
-                .or_else(|| {
-                    param_indices
-                        .get(name)
-                        .copied()
-                        .map(PrincipalReference::Argument)
-                })
-                .or_else(|| self.principal_constants.get(name).cloned())
-                .unwrap_or(PrincipalReference::Any),
+            SymbolicExpressionType::Atom(name) => {
+                if name.as_str() == "tx-sender" {
+                    return PrincipalReference::TxSender;
+                }
+                if name.as_str() == "contract-caller" {
+                    return PrincipalReference::ContractCaller;
+                }
+                if name.as_str() == "current-contract" {
+                    return PrincipalReference::CurrentContract;
+                }
+                bindings
+                    .get(name)
+                    .cloned()
+                    .or_else(|| {
+                        param_indices
+                            .get(name)
+                            .copied()
+                            .map(PrincipalReference::Argument)
+                    })
+                    .or_else(|| self.principal_constants.get(name).cloned())
+                    .unwrap_or(PrincipalReference::Any)
+            }
+            SymbolicExpressionType::List(list) => {
+                let Some((head, args)) = list.split_first() else {
+                    return PrincipalReference::Any;
+                };
+                if head.match_atom().map(|name| name.as_str()) == Some("as-contract")
+                    && let Some(inner) = args.first()
+                    && let SymbolicExpressionType::Atom(atom) = &inner.expr
+                    && atom.as_str() == "tx-sender"
+                {
+                    return PrincipalReference::CurrentContract;
+                }
+                PrincipalReference::Any
+            }
             _ => PrincipalReference::Any,
         }
     }

@@ -1177,6 +1177,7 @@ fn analyze_tx_effects(
 ) -> TxEffectsReport {
     let txid = tx.txid();
     let label = tx_label(tx);
+    let tx_sender = origin_principal(tx);
     let mut contract_effects: BTreeMap<
         QualifiedContractIdentifier,
         BTreeMap<ClarityName, FunctionEffects>,
@@ -1286,7 +1287,12 @@ fn analyze_tx_effects(
                     };
                 }
             };
-            resolved = resolve_principal_effects(&resolved, &arg_principals);
+            resolved = resolve_principal_effects(
+                &resolved,
+                &arg_principals,
+                tx_sender.as_ref(),
+                Some(&contract_id),
+            );
             apply_tx_prereqs(&mut resolved, tx);
 
             let unresolved = resolved.contract_calls.len();
@@ -1421,6 +1427,8 @@ fn analyze_tx_effects(
                     };
                 }
             };
+            resolved =
+                resolve_principal_effects(&resolved, &[], tx_sender.as_ref(), Some(&contract_id));
             apply_tx_prereqs(&mut resolved, tx);
             let unresolved = resolved.contract_calls.len();
             TxEffectsReport {
@@ -1789,10 +1797,14 @@ fn extract_principal_arg(value: &Value) -> Option<PrincipalData> {
 fn resolve_principal_effects(
     effects: &FunctionEffects,
     arg_principals: &[Option<PrincipalData>],
+    tx_sender: Option<&PrincipalData>,
+    current_contract: Option<&QualifiedContractIdentifier>,
 ) -> FunctionEffects {
     let mut resolved = effects.clone();
-    resolved.reads = resolve_principal_effect_set(&effects.reads, arg_principals);
-    resolved.writes = resolve_principal_effect_set(&effects.writes, arg_principals);
+    resolved.reads =
+        resolve_principal_effect_set(&effects.reads, arg_principals, tx_sender, current_contract);
+    resolved.writes =
+        resolve_principal_effect_set(&effects.writes, arg_principals, tx_sender, current_contract);
     resolved
 }
 
@@ -1800,19 +1812,31 @@ fn resolve_principal_effects(
 fn resolve_principal_effect_set(
     effects: &BTreeSet<EffectTarget>,
     arg_principals: &[Option<PrincipalData>],
+    tx_sender: Option<&PrincipalData>,
+    current_contract: Option<&QualifiedContractIdentifier>,
 ) -> BTreeSet<EffectTarget> {
     effects
         .iter()
         .map(|effect| match effect {
             EffectTarget::AssetOwnership(access) => {
-                let principal = resolve_principal_reference(&access.principal, arg_principals);
+                let principal = resolve_principal_reference(
+                    &access.principal,
+                    arg_principals,
+                    tx_sender,
+                    current_contract,
+                );
                 EffectTarget::AssetOwnership(AssetOwnershipAccess {
                     asset: access.asset.clone(),
                     principal,
                 })
             }
             EffectTarget::AccountNonce(access) => {
-                let principal = resolve_principal_reference(&access.principal, arg_principals);
+                let principal = resolve_principal_reference(
+                    &access.principal,
+                    arg_principals,
+                    tx_sender,
+                    current_contract,
+                );
                 EffectTarget::AccountNonce(AccountNonceAccess { principal })
             }
             other => other.clone(),
@@ -1824,12 +1848,26 @@ fn resolve_principal_effect_set(
 fn resolve_principal_reference(
     reference: &PrincipalReference,
     arg_principals: &[Option<PrincipalData>],
+    tx_sender: Option<&PrincipalData>,
+    current_contract: Option<&QualifiedContractIdentifier>,
 ) -> PrincipalReference {
     match reference {
         PrincipalReference::Argument(index) => arg_principals
             .get(*index as usize)
             .and_then(|value| value.clone())
             .map(PrincipalReference::Literal)
+            .unwrap_or(PrincipalReference::Any),
+        PrincipalReference::TxSender => tx_sender
+            .cloned()
+            .map(PrincipalReference::Literal)
+            .unwrap_or(PrincipalReference::Any),
+        PrincipalReference::ContractCaller => tx_sender
+            .cloned()
+            .map(PrincipalReference::Literal)
+            .unwrap_or(PrincipalReference::Any),
+        PrincipalReference::CurrentContract => current_contract
+            .cloned()
+            .map(|contract_id| PrincipalReference::Literal(PrincipalData::Contract(contract_id)))
             .unwrap_or(PrincipalReference::Any),
         other => other.clone(),
     }
@@ -2287,6 +2325,9 @@ fn format_principal_reference(reference: &PrincipalReference) -> String {
         PrincipalReference::Any => "<any>".to_string(),
         PrincipalReference::Literal(principal) => principal.to_string(),
         PrincipalReference::Argument(index) => format!("$arg[{index}]"),
+        PrincipalReference::TxSender => "tx-sender".to_string(),
+        PrincipalReference::ContractCaller => "contract-caller".to_string(),
+        PrincipalReference::CurrentContract => "current-contract".to_string(),
     }
 }
 

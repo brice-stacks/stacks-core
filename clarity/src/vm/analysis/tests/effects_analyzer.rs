@@ -43,6 +43,8 @@ fn test_effects_contract_call_argument_reference() {
     let expected = ContractCall {
         contract: ContractReference::Argument(0),
         function: "compute".into(),
+        arg_principals: vec![],
+        caller: Some(analysis.contract_identifier.clone()),
     };
     assert!(effects.contract_calls.contains(&expected));
 }
@@ -64,6 +66,8 @@ fn test_effects_contract_call_any_reference() {
     let expected = ContractCall {
         contract: ContractReference::Any,
         function: "compute".into(),
+        arg_principals: vec![],
+        caller: Some(analysis.contract_identifier.clone()),
     };
     assert!(effects.contract_calls.contains(&expected));
 }
@@ -425,6 +429,8 @@ fn test_effects_contract_call_propagation() {
     let expected = ContractCall {
         contract: ContractReference::Argument(0),
         function: "compute".into(),
+        arg_principals: vec![],
+        caller: Some(analysis.contract_identifier.clone()),
     };
     let outer = analysis
         .function_effects
@@ -450,6 +456,8 @@ fn test_effects_contract_call_resolution() {
     caller_effects.contract_calls.insert(ContractCall {
         contract: ContractReference::Literal(contract_id),
         function: "read".into(),
+        arg_principals: vec![],
+        caller: None,
     });
 
     let resolved = caller_effects.resolve_contract_calls(&[], &contracts);
@@ -478,6 +486,8 @@ fn test_effects_contract_call_argument_resolution() {
     caller_effects.contract_calls.insert(ContractCall {
         contract: ContractReference::Argument(0),
         function: "read".into(),
+        arg_principals: vec![],
+        caller: None,
     });
 
     let resolved = caller_effects.resolve_contract_calls(&[Some(contract_id)], &contracts);

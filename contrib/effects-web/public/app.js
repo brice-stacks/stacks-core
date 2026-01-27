@@ -831,7 +831,7 @@ function formatAssetDisplay(assetId) {
     return { display: assetId, copyValue: null, badge: null, name: null };
   }
   if (assetId === "stx") {
-    return { display: "stx", copyValue: null, badge: "stx", name: "stx" };
+    return { display: "stx", copyValue: null, badge: "stx", name: null };
   }
   const parts = assetId.split(".");
   if (parts.length < 3) {
@@ -839,19 +839,20 @@ function formatAssetDisplay(assetId) {
       display: shortenContractId(assetId),
       copyValue: isCopyablePrincipal(assetId) ? assetId : null,
       badge: null,
-      name: assetId,
+      name: null,
     };
   }
   const contract = `${parts[0]}.${parts[1]}`;
   const rest = parts.slice(2).join(".");
-  const tokenName = parts[2] || rest;
-  const tokenKind = rest.includes("(ft)") ? "ft" : rest.includes("(nft)") ? "nft" : null;
-  const display = `${shortenContractId(contract)}.${rest}`;
+  const kindMatch = rest.match(/\((ft|nft)\)\s*$/);
+  const tokenKind = kindMatch ? kindMatch[1] : null;
+  const restName = rest.replace(/\s*\((ft|nft)\)\s*$/, "");
+  const display = `${shortenContractId(contract)}.${restName}`;
   return {
     display,
-    copyValue: contract,
+    copyValue: assetId,
     badge: tokenKind,
-    name: tokenName,
+    name: null,
   };
 }
 

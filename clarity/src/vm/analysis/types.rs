@@ -53,6 +53,12 @@ pub enum PrincipalReference {
     Literal(PrincipalData),
     /// Principal supplied via function argument index.
     Argument(u32),
+    /// Principal supplied by the transaction sender.
+    TxSender,
+    /// Principal supplied by the contract caller.
+    ContractCaller,
+    /// The currently executing contract principal.
+    CurrentContract,
 }
 
 impl PartialOrd for PrincipalReference {
@@ -70,8 +76,49 @@ impl Ord for PrincipalReference {
             (PrincipalReference::Argument(left), PrincipalReference::Argument(right)) => {
                 left.cmp(right)
             }
+            (PrincipalReference::Argument(_), PrincipalReference::TxSender) => Ordering::Less,
+            (PrincipalReference::TxSender, PrincipalReference::Argument(_)) => Ordering::Greater,
+            (PrincipalReference::Argument(_), PrincipalReference::ContractCaller) => Ordering::Less,
+            (PrincipalReference::ContractCaller, PrincipalReference::Argument(_)) => {
+                Ordering::Greater
+            }
+            (PrincipalReference::Argument(_), PrincipalReference::CurrentContract) => {
+                Ordering::Less
+            }
+            (PrincipalReference::CurrentContract, PrincipalReference::Argument(_)) => {
+                Ordering::Greater
+            }
             (PrincipalReference::Argument(_), PrincipalReference::Literal(_)) => Ordering::Less,
             (PrincipalReference::Literal(_), PrincipalReference::Argument(_)) => Ordering::Greater,
+            (PrincipalReference::TxSender, PrincipalReference::TxSender) => Ordering::Equal,
+            (PrincipalReference::TxSender, PrincipalReference::Literal(_)) => Ordering::Less,
+            (PrincipalReference::Literal(_), PrincipalReference::TxSender) => Ordering::Greater,
+            (PrincipalReference::TxSender, PrincipalReference::ContractCaller) => Ordering::Less,
+            (PrincipalReference::ContractCaller, PrincipalReference::TxSender) => Ordering::Greater,
+            (PrincipalReference::TxSender, PrincipalReference::CurrentContract) => Ordering::Less,
+            (PrincipalReference::CurrentContract, PrincipalReference::TxSender) => {
+                Ordering::Greater
+            }
+            (PrincipalReference::ContractCaller, PrincipalReference::ContractCaller) => {
+                Ordering::Equal
+            }
+            (PrincipalReference::ContractCaller, PrincipalReference::Literal(_)) => Ordering::Less,
+            (PrincipalReference::Literal(_), PrincipalReference::ContractCaller) => {
+                Ordering::Greater
+            }
+            (PrincipalReference::ContractCaller, PrincipalReference::CurrentContract) => {
+                Ordering::Less
+            }
+            (PrincipalReference::CurrentContract, PrincipalReference::ContractCaller) => {
+                Ordering::Greater
+            }
+            (PrincipalReference::CurrentContract, PrincipalReference::CurrentContract) => {
+                Ordering::Equal
+            }
+            (PrincipalReference::CurrentContract, PrincipalReference::Literal(_)) => Ordering::Less,
+            (PrincipalReference::Literal(_), PrincipalReference::CurrentContract) => {
+                Ordering::Greater
+            }
             (PrincipalReference::Literal(left), PrincipalReference::Literal(right)) => {
                 left.to_string().cmp(&right.to_string())
             }
@@ -119,6 +166,12 @@ pub struct ContractCall {
     pub contract: ContractReference,
     /// Target function name within the contract.
     pub function: ClarityName,
+    /// Principal references for call arguments (by position).
+    #[serde(default)]
+    pub arg_principals: Vec<PrincipalReference>,
+    /// Calling contract, if known.
+    #[serde(default)]
+    pub caller: Option<QualifiedContractIdentifier>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -220,16 +273,23 @@ impl FunctionEffects {
                 if let Some(functions) = contracts.get(&contract_id)
                     && let Some(effects) = functions.get(&call.function)
                 {
-                    resolved.reads.extend(effects.reads.iter().cloned());
-                    resolved.writes.extend(effects.writes.iter().cloned());
+                    let remapped = effects.remap_principal_args(
+                        &call.arg_principals,
+                        call.caller.as_ref(),
+                        &contract_id,
+                    );
+                    resolved.reads.extend(remapped.reads.iter().cloned());
+                    resolved.writes.extend(remapped.writes.iter().cloned());
                     resolved
                         .contract_calls
-                        .extend(effects.contract_calls.iter().cloned());
+                        .extend(remapped.contract_calls.iter().cloned());
                     continue;
                 }
                 resolved.contract_calls.insert(ContractCall {
                     contract: ContractReference::Literal(contract_id),
                     function: call.function.clone(),
+                    arg_principals: call.arg_principals.clone(),
+                    caller: call.caller.clone(),
                 });
             } else {
                 resolved.contract_calls.insert(call.clone());
@@ -237,6 +297,118 @@ impl FunctionEffects {
         }
 
         resolved
+    }
+
+    fn remap_principal_args(
+        &self,
+        arg_principals: &[PrincipalReference],
+        caller_contract: Option<&QualifiedContractIdentifier>,
+        current_contract: &QualifiedContractIdentifier,
+    ) -> FunctionEffects {
+        let reads = self
+            .reads
+            .iter()
+            .map(|effect| {
+                remap_effect_principals(effect, arg_principals, caller_contract, current_contract)
+            })
+            .collect();
+        let writes = self
+            .writes
+            .iter()
+            .map(|effect| {
+                remap_effect_principals(effect, arg_principals, caller_contract, current_contract)
+            })
+            .collect();
+        let contract_calls = self
+            .contract_calls
+            .iter()
+            .map(|call| {
+                remap_call_principals(call, arg_principals, caller_contract, current_contract)
+            })
+            .collect();
+        FunctionEffects {
+            reads,
+            writes,
+            contract_calls,
+            purity: self.purity.clone(),
+        }
+    }
+}
+
+fn remap_effect_principals(
+    effect: &EffectTarget,
+    arg_principals: &[PrincipalReference],
+    caller_contract: Option<&QualifiedContractIdentifier>,
+    current_contract: &QualifiedContractIdentifier,
+) -> EffectTarget {
+    match effect {
+        EffectTarget::AssetOwnership(access) => {
+            EffectTarget::AssetOwnership(AssetOwnershipAccess {
+                asset: access.asset.clone(),
+                principal: remap_principal_reference(
+                    &access.principal,
+                    arg_principals,
+                    caller_contract,
+                    current_contract,
+                ),
+            })
+        }
+        EffectTarget::AccountNonce(access) => EffectTarget::AccountNonce(AccountNonceAccess {
+            principal: remap_principal_reference(
+                &access.principal,
+                arg_principals,
+                caller_contract,
+                current_contract,
+            ),
+        }),
+        other => other.clone(),
+    }
+}
+
+fn remap_call_principals(
+    call: &ContractCall,
+    arg_principals: &[PrincipalReference],
+    caller_contract: Option<&QualifiedContractIdentifier>,
+    current_contract: &QualifiedContractIdentifier,
+) -> ContractCall {
+    ContractCall {
+        contract: call.contract.clone(),
+        function: call.function.clone(),
+        arg_principals: call
+            .arg_principals
+            .iter()
+            .map(|reference| {
+                remap_principal_reference(
+                    reference,
+                    arg_principals,
+                    caller_contract,
+                    current_contract,
+                )
+            })
+            .collect(),
+        caller: call.caller.clone(),
+    }
+}
+
+fn remap_principal_reference(
+    reference: &PrincipalReference,
+    arg_principals: &[PrincipalReference],
+    caller_contract: Option<&QualifiedContractIdentifier>,
+    current_contract: &QualifiedContractIdentifier,
+) -> PrincipalReference {
+    match reference {
+        PrincipalReference::Argument(index) => arg_principals
+            .get(*index as usize)
+            .cloned()
+            .unwrap_or(PrincipalReference::Any),
+        PrincipalReference::ContractCaller => caller_contract
+            .cloned()
+            .map(|contract_id| PrincipalReference::Literal(PrincipalData::Contract(contract_id)))
+            .unwrap_or(PrincipalReference::Any),
+        PrincipalReference::CurrentContract => {
+            PrincipalReference::Literal(PrincipalData::Contract(current_contract.clone()))
+        }
+        other => other.clone(),
     }
 }
 
