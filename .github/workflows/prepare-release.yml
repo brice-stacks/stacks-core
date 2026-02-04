@@ -1,0 +1,147 @@
+## Github workflow to prepare a release branch and PR
+
+name: Prepare Release Branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (ex: 3.3.0.0.6)"
+        required: true
+        type: string
+
+concurrency:
+  group: prepare-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  ## This job's sole purpose is trigger a secondary approval outside of the job below.
+  ##   - If this job isn't approved to run, then the subsequent job will also not run - for this reason, we always exit 0
+  ##   - `andon-cord` requires the repo environment "Build Release", which will trigger a secondary approval step before running this workflow.
+  andon-cord:
+    name: Andon Cord
+    runs-on: ubuntu-latest
+    environment: "Build Release"
+    steps:
+      - name: Check Approval
+        run: |
+          exit 0
+
+  prepare-release:
+    name: Prepare Release ${{ inputs.version }}
+    runs-on: ubuntu-latest
+    needs:
+      - andon-cord
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout develop
+        uses: actions/checkout@v4
+        with:
+          ref: develop
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Ensure branches do not already exist
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin "prepare-release-${VERSION}" >/dev/null 2>&1; then
+            echo "Branch prepare-release-${VERSION} already exists."
+            exit 1
+          fi
+          if git ls-remote --exit-code --heads origin "release/${VERSION}" >/dev/null 2>&1; then
+            echo "Branch release/${VERSION} already exists."
+            exit 1
+          fi
+
+      - name: Update versions and changelogs
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ["VERSION"].strip()
+          if not version:
+            raise SystemExit("VERSION is empty")
+
+          if "-" in version:
+            raise SystemExit("Version must be X.Y.A.B.C with no suffix")
+
+          parts = version.split(".")
+          if len(parts) != 5 or any(p == "" for p in parts):
+            raise SystemExit("Version must be X.Y.A.B.C")
+
+          signer_version = version + ".0"
+
+          def replace_line(path: Path, pattern: str, replacement: str) -> None:
+            text = path.read_text()
+            new_text, count = re.subn(pattern, replacement, text, flags=re.MULTILINE)
+            if count != 1:
+              raise SystemExit(f"Expected 1 replacement in {path}, got {count}")
+            path.write_text(new_text)
+
+          replace_line(
+            Path("versions.toml"),
+            r'^stacks_node_version = ".*"$',
+            f'stacks_node_version = "{version}"',
+          )
+          replace_line(
+            Path("versions.toml"),
+            r'^stacks_signer_version = ".*"$',
+            f'stacks_signer_version = "{signer_version}"',
+          )
+
+          def replace_unreleased(path: Path, ver: str) -> None:
+            text = path.read_text()
+            marker = "## [Unreleased]"
+            if marker not in text:
+              return
+            path.write_text(text.replace(marker, f"## [{ver}]", 1))
+
+          replace_unreleased(Path("CHANGELOG.md"), version)
+          replace_unreleased(Path("stacks-signer/CHANGELOG.md"), signer_version)
+          PY
+
+      - name: Create release prep branch and commit
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          git checkout -b "prepare-release-${VERSION}"
+          if git diff --quiet; then
+            echo "No changes to commit."
+            exit 1
+          fi
+          git add versions.toml CHANGELOG.md stacks-signer/CHANGELOG.md
+          git commit -m "Prepare release ${VERSION}"
+
+      - name: Push branches
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          git push origin "prepare-release-${VERSION}"
+          git branch "release/${VERSION}"
+          git push origin "release/${VERSION}"
+
+      - name: Open PR into develop
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh pr create \
+            --base develop \
+            --head "prepare-release-${VERSION}" \
+            --title "Prepare release ${VERSION}" \
+            --body "Automated release prep for ${VERSION}."
