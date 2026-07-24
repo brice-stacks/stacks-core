@@ -1308,6 +1308,27 @@ impl<'a, 'b> Environment<'a, 'b> {
                 return Err(CheckErrors::NoSuchPublicFunction(contract_identifier.to_string(), tx_name.to_string()).into());
             }
 
+            // sanitize contract-call inputs in epochs >= 2.4, exactly as
+            // `inner_execute_contract` does on the interpreter path
+            let args: Result<Vec<Value>> = args.iter()
+                .map(|value| {
+                    let expected_type = TypeSignature::type_of(value)?;
+                    let (sanitized_value, _) = Value::sanitize_value(
+                        self.epoch(),
+                        &expected_type,
+                        value.clone(),
+                    ).ok_or_else(|| CheckErrors::TypeValueError(
+                            Box::new(expected_type),
+                            Box::new(value.clone()),
+                        )
+                    )?;
+
+                    Ok(sanitized_value)
+                })
+                .collect();
+
+            let args = args?;
+
             let func_identifier = func.get_identifier();
             if self.call_stack.contains(&func_identifier) {
                 return Err(CheckErrors::CircularReference(vec![func_identifier.to_string()]).into())

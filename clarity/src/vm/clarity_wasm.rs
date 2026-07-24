@@ -6514,22 +6514,151 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                     function_length,
                 )?;
 
+                // For dynamic dispatch, read the trait identifier from the
+                // Wasm memory
+                let trait_id = if trait_id_length == 0 {
+                    None
+                } else {
+                    let bytes = read_bytes_from_wasm(
+                        memory,
+                        &mut caller,
+                        trait_id_offset,
+                        trait_id_length,
+                    )?;
+                    Some(trait_identifier_from_bytes(&bytes)?)
+                };
+
+                // Ensure that a trait reference is used for inter-contract
+                // calls only, as in the interpreter's `special_contract_call`.
+                if trait_id.is_some()
+                    && *contract_id == caller.data().contract_context().contract_identifier
+                {
+                    return Err(CheckErrors::CircularReference(vec![contract_id
+                        .name
+                        .to_string()])
+                    .into());
+                }
+
                 // Retrieve the contract context for the contract we're calling
-                let mut contract = caller
+                let contract = caller
                     .data_mut()
                     .global_context
                     .database
-                    .get_contract(contract_id)?;
+                    .get_contract(contract_id)
+                    .map_err(|e| {
+                        if trait_id.is_some() {
+                            CheckErrors::NoSuchContract(contract_id.to_string()).into()
+                        } else {
+                            e
+                        }
+                    })?;
 
-                // Retrieve the function we're calling
-                let function = contract
-                    .contract_context
-                    .functions
-                    .get(function_name.as_str())
-                    .ok_or(CheckErrors::NoSuchPublicFunction(
-                        contract_id.to_string(),
-                        function_name.to_string(),
-                    ))?;
+                // Retrieve the function we're calling and determine the return
+                // type used to write the result back into Wasm memory. For
+                // dynamic dispatch, first validate the call against the trait
+                // definition, exactly as the interpreter does in
+                // `special_contract_call`; `type_returns_constraint` holds the
+                // trait's declared return type when those runtime checks apply.
+                let (function, return_ty, type_returns_constraint) = match &trait_id {
+                    None => {
+                        // Static dispatch
+                        let function = contract
+                            .contract_context
+                            .functions
+                            .get(function_name.as_str())
+                            .ok_or(CheckErrors::UndefinedFunction(function_name.to_string()))?;
+                        let return_ty = function
+                            .get_return_type()
+                            .as_ref()
+                            .ok_or(CheckErrors::DefineFunctionBadSignature)?
+                            .clone();
+                        (function, return_ty, None)
+                    }
+                    Some(trait_id) => {
+                        // Dynamic dispatch: if the contract explicitly
+                        // implements the trait with `impl-trait`, we can rely
+                        // on the analysis performed at publish time and skip
+                        // the runtime checks.
+                        let short_circuit_checks = contract
+                            .contract_context
+                            .is_explicitly_implementing_trait(trait_id);
+
+                        // Retrieve the contract context defining the trait
+                        let defining_contract;
+                        let defining_context = if trait_id.contract_identifier == *contract_id {
+                            &contract.contract_context
+                        } else {
+                            defining_contract = caller
+                                .data_mut()
+                                .global_context
+                                .database
+                                .get_contract(&trait_id.contract_identifier)
+                                .map_err(|_| {
+                                    CheckErrors::NoSuchContract(
+                                        trait_id.contract_identifier.to_string(),
+                                    )
+                                })?;
+                            &defining_contract.contract_context
+                        };
+
+                        // Retrieve the function that will be invoked
+                        let function = contract
+                            .contract_context
+                            .functions
+                            .get(function_name.as_str())
+                            .ok_or_else(|| {
+                                if short_circuit_checks {
+                                    CheckErrors::UndefinedFunction(function_name.to_string())
+                                } else {
+                                    CheckErrors::BadTraitImplementation(
+                                        trait_id.name.to_string(),
+                                        function_name.to_string(),
+                                    )
+                                }
+                            })?;
+
+                        if !short_circuit_checks {
+                            // Check read/write compatibility
+                            if caller.data().global_context.is_read_only() {
+                                return Err(
+                                    CheckErrors::TraitBasedContractCallInReadOnly.into()
+                                );
+                            }
+
+                            // Check visibility
+                            if function.define_type == DefineType::Private {
+                                return Err(CheckErrors::NoSuchPublicFunction(
+                                    contract_id.to_string(),
+                                    function_name.to_string(),
+                                )
+                                .into());
+                            }
+
+                            function.check_trait_expectations(
+                                &epoch,
+                                defining_context,
+                                trait_id,
+                            )?;
+                        }
+
+                        // Retrieve the expected method signature from the
+                        // trait definition
+                        let trait_name = trait_id.name.to_string();
+                        let expected_returns = defining_context
+                            .lookup_trait_definition(&trait_name)
+                            .ok_or(CheckErrors::TraitReferenceUnknown(trait_name.clone()))?
+                            .get(function_name.as_str())
+                            .map(|f_ty| f_ty.returns.clone())
+                            .ok_or(CheckErrors::TraitMethodUnknown(
+                                trait_name,
+                                function_name.to_string(),
+                            ))?;
+
+                        let constraint =
+                            (!short_circuit_checks).then(|| expected_returns.clone());
+                        (function, expected_returns, constraint)
+                    }
+                };
 
                 let mut args = Vec::new();
                 let mut args_sizes = Vec::new();
@@ -6586,42 +6715,32 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                     env.execute_contract_from_wasm(contract_id, &function_name, &args)
                 }?;
 
-                // Write the result to the return buffer
-                let return_ty = if trait_id_length == 0 {
-                    // This is a direct call
-                    function
-                        .get_return_type()
-                        .as_ref()
-                        .ok_or(CheckErrors::DefineFunctionBadSignature)?
-                } else {
-                    // This is a dynamic call
-                    let trait_id =
-                        read_bytes_from_wasm(memory, &mut caller, trait_id_offset, trait_id_length)
-                            .and_then(|bs| trait_identifier_from_bytes(&bs))?;
-                    contract = if &trait_id.contract_identifier == contract_id {
-                        contract
-                    } else {
-                        caller
-                            .data_mut()
-                            .global_context
-                            .database
-                            .get_contract(&trait_id.contract_identifier)?
-                    };
-                    contract
-                        .contract_context
-                        .defined_traits
-                        .get(trait_id.name.as_str())
-                        .and_then(|trait_functions| trait_functions.get(function_name.as_str()))
-                        .map(|f_ty| &f_ty.returns)
-                        .ok_or(CheckErrors::DefineFunctionBadSignature)?
-                };
+                // sanitize contract-call outputs in epochs >= 2.4, as the
+                // interpreter does in `special_contract_call`
+                let result_type = TypeSignature::type_of(&result)?;
+                let (result, _) = Value::sanitize_value(&epoch, &result_type, result)
+                    .ok_or(CheckErrors::CouldNotDetermineType)?;
 
+                // Ensure that the expected type from the trait spec admits
+                // the type of the value returned by the dynamic dispatch.
+                if let Some(returns_type_signature) = type_returns_constraint {
+                    let actual_returns = TypeSignature::type_of(&result)?;
+                    if !returns_type_signature.admits_type(&epoch, &actual_returns)? {
+                        return Err(CheckErrors::ReturnTypesMustMatch(
+                            Box::new(returns_type_signature),
+                            Box::new(actual_returns),
+                        )
+                        .into());
+                    }
+                }
+
+                // Write the result to the return buffer
                 write_to_wasm(
                     &mut caller,
                     memory,
-                    return_ty,
+                    &return_ty,
                     return_offset,
-                    return_offset + get_type_size(return_ty),
+                    return_offset + get_type_size(&return_ty),
                     &result,
                     true,
                 )?;
