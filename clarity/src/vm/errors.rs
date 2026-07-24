@@ -14,9 +14,11 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+#[cfg(feature = "clarity-wasm")]
+pub use clarity_types::errors::WasmError;
 pub use clarity_types::errors::{
     Error, IncomparableError, InterpreterError, InterpreterResult, RuntimeErrorType,
-    ShortReturnType, WasmError,
+    ShortReturnType,
 };
 
 pub use crate::vm::analysis::errors::{

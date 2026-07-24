@@ -90,7 +90,7 @@ disable-costs = []
 developer-mode = ["clarity/developer-mode"]
 monitoring_prom = ["prometheus"]
 slog_json = ["stacks-common/slog_json", "clarity/slog_json", "pox-locking/slog_json"]
-clarity-wasm = []
+clarity-wasm = ["clarity/clarity-wasm"]
 testing = ["chrono", "stacks-common/testing", "clarity/testing"]
 
 [target.'cfg(all(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64"), not(any(target_os="windows"))))'.dependencies]

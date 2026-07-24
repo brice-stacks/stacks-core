@@ -18,6 +18,7 @@ pub mod ast;
 pub mod cost;
 pub mod lexer;
 
+#[cfg(feature = "clarity-wasm")]
 use std::string::FromUtf8Error;
 use std::{error, fmt};
 
