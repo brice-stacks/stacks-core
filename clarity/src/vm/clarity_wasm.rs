@@ -9166,55 +9166,20 @@ mod error_mapping {
         epoch_id: &StacksEpochId,
         clarity_version: &ClarityVersion,
     ) -> Error {
-        if let Some(vm_error) = e.root_cause().downcast_ref::<Error>() {
-            // SAFETY:
-            //
-            // This unsafe operation returns the value of a location pointed by `*mut T`.
-            //
-            // The purpose of this code is to take the ownership of the `vm_error` value
-            // since clarity::vm::errors::Error is not a Clonable type.
-            //
-            // Converting a `&T` (vm_error) to a `*mut T` doesn't cause any issues here
-            // because the reference is not borrowed elsewhere.
-            //
-            // The replaced `T` value is deallocated after the operation. Therefore, the chosen `T`
-            // is a dummy value, solely to satisfy the signature of the replace function
-            // and not cause harm when it is deallocated.
-            //
-            // Specifically, Error::Wasm(WasmError::ModuleNotFound) was selected as the placeholder value.
-            return unsafe {
-                core::ptr::replace(
-                    (vm_error as *const Error) as *mut Error,
-                    Error::Wasm(WasmError::ModuleNotFound),
-                )
-            };
-        }
+        // `wasmtime::Error` is `anyhow::Error`, so `downcast` peels off any
+        // context layers and returns the original error by value. Since
+        // `Error` and `CheckErrors` report no `source()`, a successful
+        // `root_cause()` match implies they are the payload, so `downcast`
+        // finds them too.
+        let e = match e.downcast::<Error>() {
+            Ok(vm_error) => return vm_error,
+            Err(e) => e,
+        };
 
-        if let Some(vm_error) = e.root_cause().downcast_ref::<CheckErrors>() {
-            // SAFETY:
-            //
-            // This unsafe operation returns the value of a location pointed by `*mut T`.
-            //
-            // The purpose of this code is to take the ownership of the `vm_error` value
-            // since clarity::vm::errors::Error is not a Clonable type.
-            //
-            // Converting a `&T` (vm_error) to a `*mut T` doesn't cause any issues here
-            // because the reference is not borrowed elsewhere.
-            //
-            // The replaced `T` value is deallocated after the operation. Therefore, the chosen `T`
-            // is a dummy value, solely to satisfy the signature of the replace function
-            // and not cause harm when it is deallocated.
-            //
-            // Specifically, CheckErrors::ExpectedName was selected as the placeholder value.
-            return unsafe {
-                let err = core::ptr::replace(
-                    (vm_error as *const CheckErrors) as *mut CheckErrors,
-                    CheckErrors::ExpectedName,
-                );
-
-                <CheckErrors as std::convert::Into<Error>>::into(err)
-            };
-        }
+        let e = match e.downcast::<CheckErrors>() {
+            Ok(check_error) => return check_error.into(),
+            Err(e) => e,
+        };
 
         // Check if the error is caused by
         // an unreachable Wasm trap.
