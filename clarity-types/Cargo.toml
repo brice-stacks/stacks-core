@@ -33,6 +33,8 @@ testing = ["stacks_common/testing"]
 developer-mode = ["stacks_common/developer-mode"]
 slog_json = ["stacks_common/slog_json"]
 rusqlite = ["stacks_common/rusqlite", "dep:rusqlite", "dep:serde_json"]
+# Diagnostic hooks for `stacks-inspect audit-contract-types`; inert unless enabled at runtime.
+type-audit = []
 
 # Wasm-specific features for easier configuration
 wasm-web = ["stacks_common/wasm-web"]

@@ -360,6 +360,31 @@ pub enum Command {
         network: String,
     },
 
+    /// Re-typecheck every contract in a chainstate and report the type-checker
+    /// behaviors that the Wasm runtime cannot reproduce
+    #[command(name = "audit-contract-types")]
+    AuditContractTypes {
+        /// Path to chainstate directory
+        #[arg(value_name = "CHAINSTATE_DIR")]
+        chainstate_dir: String,
+
+        /// Network (mainnet, krypton, naka3)
+        #[arg(value_name = "NETWORK")]
+        network: String,
+
+        /// Chain tip to audit at (defaults to the canonical tip)
+        #[arg(long, value_name = "CHAIN_TIP")]
+        chain_tip: Option<String>,
+
+        /// Write the full report as JSON to this file
+        #[arg(long, value_name = "FILE")]
+        output: Option<String>,
+
+        /// Only audit these contracts (repeatable); defaults to every contract
+        #[arg(long = "contract", value_name = "CONTRACT_ID")]
+        contracts: Vec<String>,
+    },
+
     /// Get account state at a chain tip
     #[command(name = "get-account")]
     GetAccount {

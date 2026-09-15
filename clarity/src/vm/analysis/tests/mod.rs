@@ -610,3 +610,74 @@ fn test_order_of_readonly_check_and_type_check() {
         err
     );
 }
+
+/// The `type-audit` hooks fire on real contracts. One test, because the sink
+/// they record into is global to the process.
+#[cfg(feature = "type-audit")]
+#[test]
+fn type_audit_hooks_fire_on_known_snippets() {
+    use clarity_types::audit::{self, TypeAuditEvent};
+
+    // stx-labs/clarity-wasm#858: the arms of an `if` unify although the second
+    // one has an extra field.
+    let if_snippet = "
+(define-private (f (x bool))
+  (begin
+    (if x {id: u1, price: u2} {id: u1, price: u2, splits-paid: u3})
+    (ok u1)))";
+    // The `fold` result type ignores the initial value: `(err u2)` is typed
+    // `(response NoType uint)` but the fold gets `(response uint NoType)`.
+    let fold_snippet = "
+(define-private (f (x int) (acc (response uint uint)))
+  (ok (+ (unwrap-panic acc) u1)))
+(define-private (run (l (list 5 int)))
+  (fold f l (err u2)))";
+    // A well-typed fold with an untyped initial value must stay quiet.
+    let quiet_snippet = "
+(define-private (f (x int) (acc (optional int))) (some x))
+(define-private (run (l (list 5 int))) (fold f l none))";
+
+    for (version, epoch) in [
+        (ClarityVersion::Clarity1, StacksEpochId::Epoch2_05),
+        (ClarityVersion::Clarity1, StacksEpochId::Epoch21),
+        (ClarityVersion::Clarity2, StacksEpochId::Epoch21),
+        (ClarityVersion::Clarity3, StacksEpochId::Epoch30),
+    ] {
+        audit::enable();
+        audit::drain();
+        crate::vm::analysis::mem_type_check(if_snippet, version, epoch).unwrap();
+        let events = audit::drain();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                TypeAuditEvent::TupleSupertypeKeyMismatch { a, b, .. }
+                    if a.to_string() == "(tuple (id uint) (price uint))"
+                        && b.to_string() == "(tuple (id uint) (price uint) (splits-paid uint))"
+            )),
+            "{version} {epoch:?}: {events:?}"
+        );
+
+        crate::vm::analysis::mem_type_check(fold_snippet, version, epoch).unwrap();
+        let events = audit::drain();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                TypeAuditEvent::FoldInitialTypeMismatch { initial, result, unified: Some(unified), .. }
+                    if initial.to_string() == "(response UnknownType uint)"
+                        && result.to_string() == "(response uint UnknownType)"
+                        && unified.to_string() == "(response uint uint)"
+            )),
+            "{version} {epoch:?}: {events:?}"
+        );
+
+        crate::vm::analysis::mem_type_check(quiet_snippet, version, epoch).unwrap();
+        let events = audit::drain();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, TypeAuditEvent::FoldInitialTypeMismatch { .. })),
+            "{version} {epoch:?}: {events:?}"
+        );
+        audit::disable();
+    }
+}

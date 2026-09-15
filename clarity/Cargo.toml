@@ -79,6 +79,7 @@ testing = ["rusqlite", "rstest", "rstest_reuse", "clarity-types/testing", "stack
 devtools = []
 rollback_value_check = []
 disable-costs = []
+type-audit = ["clarity-types/type-audit"]
 wasm-web = ["stacks_common/wasm-web", "clarity-types/wasm-web"]
 
 # clarity-wasm

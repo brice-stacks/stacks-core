@@ -23,6 +23,7 @@ use clarity::types::chainstate::StacksPrivateKey;
 use clarity_cli::{DEFAULT_CLI_EPOCH, read_file_or_stdin, read_file_or_stdin_bytes, vm_execute};
 use stacks_common::alloc_tracker::TrackingAllocator;
 use stacks_inspect::cli::{Cli, Command};
+use stacks_inspect::type_audit::{TypeAuditArgs, command_audit_contract_types};
 use stacks_inspect::{
     CommonOpts, command_contract_hash, command_replay_mock_mining, command_try_mine,
     command_validate_block,
@@ -814,6 +815,27 @@ fn main() {
                 .unwrap()
                 .unwrap();
             println!("{}", &header.index_block_hash());
+            process::exit(0);
+        }
+
+        Command::AuditContractTypes {
+            chainstate_dir,
+            network,
+            chain_tip,
+            output,
+            contracts,
+        } => {
+            check_shadow_network(&network);
+            let (sort_db, mut chain_state) =
+                open_nakamoto_chainstate_dbs(&chainstate_dir, &network);
+            let args = TypeAuditArgs::parse(chain_tip, output, contracts).unwrap_or_else(|e| {
+                eprintln!("{e}");
+                process::exit(1);
+            });
+            if let Err(e) = command_audit_contract_types(&sort_db, &mut chain_state, args) {
+                eprintln!("{e}");
+                process::exit(1);
+            }
             process::exit(0);
         }
 

@@ -4831,6 +4831,7 @@ dependencies = [
  "clap",
  "clarity",
  "clarity-cli",
+ "clarity-types",
  "libstackerdb",
  "mutants",
  "regex",

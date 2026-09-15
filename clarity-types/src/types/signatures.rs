@@ -1046,9 +1046,12 @@ impl TypeSignature {
                     let entry_out = Self::least_supertype_v2_0(entry_a, entry_b)?;
                     type_map_out.insert(name.clone(), entry_out);
                 }
-                Ok(TupleTypeSignature::try_from(type_map_out)
-                    .map(|x| x.into())
-                    .map_err(|_| ClarityTypeError::SupertypeTooLarge)?)
+                let result: TypeSignature = TupleTypeSignature::try_from(type_map_out)
+                    .map_err(|_| ClarityTypeError::SupertypeTooLarge)?
+                    .into();
+                #[cfg(feature = "type-audit")]
+                Self::audit_tuple_supertype(a, b, &result);
+                Ok(result)
             }
             (
                 SequenceType(SequenceSubtype::ListType(ListTypeData {
@@ -1137,6 +1140,25 @@ impl TypeSignature {
         }
     }
 
+    /// Record a tuple unification whose operands have different key sets.
+    ///
+    /// The loops above only check that every key of `a` exists in `b`, so `b`
+    /// may carry keys the result type does not have: the runtime value then has
+    /// fields its static type does not describe. Only compiled while auditing.
+    #[cfg(feature = "type-audit")]
+    fn audit_tuple_supertype(a: &TypeSignature, b: &TypeSignature, result: &TypeSignature) {
+        let (TupleType(tup_a), TupleType(tup_b)) = (a, b) else {
+            return;
+        };
+        if tup_a.type_map.len() != tup_b.type_map.len() {
+            crate::audit::record(|| crate::audit::TypeAuditEvent::TupleSupertypeKeyMismatch {
+                a: a.clone(),
+                b: b.clone(),
+                result: result.clone(),
+            });
+        }
+    }
+
     pub(crate) fn least_supertype_v2_1(
         a: &TypeSignature,
         b: &TypeSignature,
@@ -1155,9 +1177,12 @@ impl TypeSignature {
                     let entry_out = Self::least_supertype_v2_1(entry_a, entry_b)?;
                     type_map_out.insert(name.clone(), entry_out);
                 }
-                Ok(TupleTypeSignature::try_from(type_map_out)
-                    .map(|x| x.into())
-                    .map_err(|_| ClarityTypeError::SupertypeTooLarge)?)
+                let result: TypeSignature = TupleTypeSignature::try_from(type_map_out)
+                    .map_err(|_| ClarityTypeError::SupertypeTooLarge)?
+                    .into();
+                #[cfg(feature = "type-audit")]
+                Self::audit_tuple_supertype(a, b, &result);
+                Ok(result)
             }
             (
                 SequenceType(SequenceSubtype::ListType(ListTypeData {

@@ -183,6 +183,8 @@ pub fn check_special_fold(
     }?;
 
     let initial_value_type = checker.type_check(&args[2], context)?;
+    #[cfg(feature = "type-audit")]
+    let audited_initial_type = initial_value_type.clone();
 
     // fold: f(A, B) -> A
     //     where A = initial_value_type
@@ -203,6 +205,15 @@ pub fn check_special_fold(
         context.epoch,
         context.clarity_version,
     )?;
+
+    // The result type ignores the initial value, which is what an empty fold returns.
+    #[cfg(feature = "type-audit")]
+    clarity_types::audit::check_fold_result(
+        &context.epoch,
+        &audited_initial_type,
+        &return_type,
+        args[2].span(),
+    );
 
     Ok(return_type)
 }
